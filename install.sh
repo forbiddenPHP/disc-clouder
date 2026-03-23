@@ -11,13 +11,37 @@ if ! command -v brew &>/dev/null; then
     exit 1
 fi
 
+# Conda prüfen
+if ! command -v conda &>/dev/null; then
+    echo "Conda nicht gefunden. Bitte Miniconda installieren: https://docs.conda.io/en/latest/miniconda.html"
+    exit 1
+fi
+
+# Conda Environment erstellen
+echo "--- Conda Environment ---"
+ENV_NAME="disc_clouder"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if conda env list | grep -q "^${ENV_NAME} "; then
+    echo "Conda env '${ENV_NAME}' existiert bereits"
+else
+    echo "Erstelle Conda env '${ENV_NAME}' mit Python 3.12.3..."
+    conda create -n "$ENV_NAME" python=3.12.3 -y
+fi
+echo "Installiere Python-Pakete in Conda env..."
+conda run -n "$ENV_NAME" pip install -r "$SCRIPT_DIR/requirements.txt"
+echo
+
 # Brew-Pakete
 echo "--- Brew-Pakete ---"
-for pkg in ffmpeg libdvdcss libaacs libbdplus megatools p7zip; do
+for pkg in ffmpeg libdvdcss libaacs libbdplus lsdvd megatools p7zip; do
     brew list "$pkg" &>/dev/null && echo "$pkg: bereits installiert" || brew install "$pkg"
 done
 for cask in vlc; do
-    brew list --cask "$cask" &>/dev/null && echo "$cask: bereits installiert" || brew install --cask "$cask"
+    if brew list --cask "$cask" &>/dev/null || [ -d "/Applications/VLC.app" ]; then
+        echo "$cask: bereits installiert"
+    else
+        brew install --cask "$cask"
+    fi
 done
 
 # Symlinks für libaacs/libbdplus (VLC sucht in /usr/local/lib/)
@@ -106,11 +130,6 @@ else
     echo "Übersprungen"
 fi
 
-# Python-Pakete
-echo
-echo "--- Python-Pakete ---"
-pip install -r "$(dirname "$0")/requirements.txt"
-
 echo
 echo "=== Installation abgeschlossen ==="
-echo "Starte mit: python $(dirname "$0")/disc_clouder.py"
+echo "Starte mit: conda run -n disc_clouder python $SCRIPT_DIR/disc_clouder.py"

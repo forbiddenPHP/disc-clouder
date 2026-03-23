@@ -1,8 +1,16 @@
-#!/Users/jophi/miniconda3/bin/python
+#!/usr/bin/env python3
 """JoPhi's Disc Clouder — DVD/Blu-ray Ripper mit eingebettetem VLC."""
 
-import json
 import os
+import sys
+
+# Auto-restart in conda env if not already there
+ENV_NAME = "disc_clouder"
+if os.environ.get("CONDA_DEFAULT_ENV") != ENV_NAME:
+    argv = " ".join(f'"{a}"' for a in sys.argv)
+    os.execvp("conda", ["conda", "run", "--no-capture-output", "-n", ENV_NAME, "python", *sys.argv])
+
+import json
 import sys
 import re
 import ctypes
@@ -470,6 +478,7 @@ class RipWorker(QThread):
                 "/Applications/VLC.app/Contents/MacOS/VLC", "-I", "dummy",
                 f"dvd://{link}#{title_num}",
                 f":no-sout-all", f":audio-track={audio_idx}",
+                f"--stop-time={duration}",
                 f"--sout=#transcode{{vcodec=h264,acodec=mp4a,ab=192,channels=2}}"
                 f":standard{{access=file,mux=ts,dst={self._tmp_rip}}}",
                 "vlc://quit",
