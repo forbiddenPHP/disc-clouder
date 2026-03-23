@@ -478,6 +478,7 @@ class RipWorker(QThread):
                 "/Applications/VLC.app/Contents/MacOS/VLC", "-I", "dummy",
                 f"dvdsimple://{link}#{title_num}",
                 f":no-sout-all", f":audio-track={audio_idx}",
+                f"--run-time={duration}",
                 f"--sout=#transcode{{vcodec=h264,acodec=mp4a,ab=192,channels=2}}"
                 f":standard{{access=file,mux=ts,dst={self._tmp_rip}}}",
                 "vlc://quit",
@@ -510,8 +511,15 @@ class RipWorker(QThread):
                     if pct != last_pct and current_sec > 5:
                         last_pct = pct
                         self._extract_thumb(current_sec - 2)
+                    # Kill VLC if we've reached the expected duration
+                    if current_sec >= duration - 5:
+                        proc.kill()
+                        proc.wait()
+                        break
                 time.sleep(2)
-            proc.wait()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
             self.progress_rip.emit(duration, duration)
             return
         else:
