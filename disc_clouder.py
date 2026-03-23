@@ -476,9 +476,8 @@ class RipWorker(QThread):
             audio_idx = job.get("audio_idx", 0)
             vlc_args = [
                 "/Applications/VLC.app/Contents/MacOS/VLC", "-I", "dummy",
-                f"dvd://{link}#{title_num}",
+                f"dvdsimple://{link}#{title_num}",
                 f":no-sout-all", f":audio-track={audio_idx}",
-                f"--stop-time={duration}",
                 f"--sout=#transcode{{vcodec=h264,acodec=mp4a,ab=192,channels=2}}"
                 f":standard{{access=file,mux=ts,dst={self._tmp_rip}}}",
                 "vlc://quit",
