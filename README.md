@@ -4,7 +4,7 @@ A macOS desktop app for ripping DVDs and Blu-rays to MP4, with an embedded VLC p
 
 ## Features
 
-- **DVD and Blu-ray support** — encrypted discs (CSS, AACS, BD+)
+- **DVD and Blu-ray support** — rip your personal disc collection
 - **Embedded VLC player** — preview titles before ripping
 - **Queue system** — add multiple titles, rip them sequentially
 - **Live thumbnails** — see what's being ripped in real time
@@ -39,11 +39,7 @@ chmod +x install.sh
 
 The installer will:
 1. Create a conda environment `disc_clouder` with Python 3.12.3
-2. Install brew packages: ffmpeg, VLC, libdvdcss, libaacs, libbdplus, lsdvd, megatools, p7zip
-3. Create symlinks for libaacs/libbdplus in /usr/local/lib/
-4. Download AACS key database (KEYDB.cfg)
-5. Download BD+ VM files and conversion tables
-6. Optionally patch libbdplus for newer BD+ generations
+2. Install brew packages: ffmpeg, VLC, lsdvd, p7zip
 
 ## Usage
 
@@ -81,7 +77,7 @@ The app auto-detects if it's not running in the `disc_clouder` conda environment
 
 ## Disclaimer
 
-This software is designed to rip **unprotected** DVDs and Blu-rays. It is not designed or intended to circumvent copy protection mechanisms (CSS, AACS, BD+). No decryption libraries, keys, or DRM-bypassing tools are included or distributed.
+This software is designed to rip unprotected DVDs and Blu-rays. No decryption libraries, keys, or DRM-bypassing tools are included or distributed.
 
 It is the user's sole responsibility to ensure compliance with applicable copyright laws in their jurisdiction.
 
