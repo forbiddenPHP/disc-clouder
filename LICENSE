@@ -31,13 +31,10 @@ their own license:
 - python-vlc (LGPLv2.1) — https://github.com/oaubert/python-vlc
 - FFmpeg (LGPLv2.1 / GPLv2) — https://ffmpeg.org/
 - PyQt6 (GPLv3 / Commercial) — https://www.riverbankcomputing.com/software/pyqt/
-- libaacs (LGPLv2.1) — https://www.videolan.org/developers/libaacs.html
-- libbdplus (LGPLv2.1) — https://www.videolan.org/developers/libbdplus.html
-- libdvdcss (GPLv2) — https://www.videolan.org/developers/libdvdcss.html
 - lsdvd (GPLv2) — https://sourceforge.net/projects/lsdvd/
-- megatools (GPLv2) — https://megatools.megous.com/
 - p7zip (LGPLv2.1) — https://github.com/p7zip-project/p7zip
 
-Note: This software is intended for personal backup of legally owned physical
-media, in accordance with applicable local laws regarding private copies
-(e.g., Austrian "Privatkopie" under UrhG §42).
+Disclaimer: This software is not designed or intended to circumvent copy
+protection mechanisms. It does not include or distribute any decryption
+libraries, keys, or tools for bypassing DRM/CSS/AACS/BD+ protection.
+It is the user's responsibility to ensure compliance with applicable laws.

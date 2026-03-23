@@ -76,15 +76,14 @@ The app auto-detects if it's not running in the `disc_clouder` conda environment
 
 | What | Where |
 |------|-------|
-| AACS keys | `~/.config/aacs/KEYDB.cfg` |
-| BD+ VM files | `~/Library/Preferences/bdplus/vm0/` |
-| BD+ conversion tables | `~/Library/Caches/bdplus/convtab/` |
 | Temp rip files | `/tmp/disc_clouder_rip.*` |
 | Output | `~/Desktop/filme_sicherungen/` (configurable) |
 
-## Legal
+## Disclaimer
 
-This software is intended for personal backup of legally owned physical media, in accordance with applicable local laws regarding private copies (e.g., Austrian "Privatkopie" under UrhG §42).
+This software is designed to rip **unprotected** DVDs and Blu-rays. It is not designed or intended to circumvent copy protection mechanisms (CSS, AACS, BD+). No decryption libraries, keys, or DRM-bypassing tools are included or distributed.
+
+It is the user's sole responsibility to ensure compliance with applicable copyright laws in their jurisdiction.
 
 ## License
 
