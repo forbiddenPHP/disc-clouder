@@ -103,6 +103,15 @@ CODEC_NAMES = {
 }
 CH_NAMES = {1: "Mono", 3: "Stereo", 6: "5.1", 12: "7.1"}
 
+# ISO 639-2 bibliographic ↔ terminological mapping
+LANG_EQUIV = {
+    "deu": "ger", "ger": "deu",
+    "fra": "fre", "fre": "fra",
+    "zho": "chi", "chi": "zho",
+    "nld": "dut", "dut": "nld",
+    "ces": "cze", "cze": "ces",
+}
+
 LANG_NAMES = {
     "deu": "Deutsch", "ger": "Deutsch", "eng": "English",
     "fra": "Français", "fre": "Français", "spa": "Español",
@@ -330,52 +339,53 @@ def get_playlist_map(mount_path):
 # ---------------------------------------------------------------------------
 # Disc detection — Blu-ray only
 # ---------------------------------------------------------------------------
+SYSTEM_VOLUMES = {"Macintosh HD", "Macintosh HD - Data", "Recovery", "Preboot", "VM", "Update"}
+
+
 def find_disc():
-    """Find a mounted Blu-ray disc."""
-    print("[FIND_DISC] Searching for Blu-ray disc...")
-    for entry in os.listdir("/dev"):
-        if not re.match(r"^disk\d+$", entry):
+    """Find a mounted Blu-ray disc by checking /Volumes/ for BDMV structure."""
+    print("[FIND_DISC] Searching for Blu-ray disc in /Volumes/...")
+    try:
+        volumes = os.listdir("/Volumes")
+    except OSError:
+        print("[FIND_DISC] Cannot read /Volumes/")
+        return None
+
+    for vol in volumes:
+        if vol in SYSTEM_VOLUMES:
             continue
-        try:
-            info = subprocess.run(
-                ["diskutil", "info", f"/dev/{entry}"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout
-        except Exception:
+        vol_path = os.path.join("/Volumes", vol)
+        if not os.path.isdir(vol_path):
             continue
-        if "Optical" not in info:
+        bdmv = os.path.join(vol_path, "BDMV")
+        if not os.path.isdir(bdmv) or not os.path.isdir(os.path.join(bdmv, "PLAYLIST")):
             continue
-        mount = re.search(r"Mount Point:\s+(.+)", info)
-        name = re.search(r"Volume Name:\s+(.+)", info)
-        media = re.search(r"Optical Media Type:\s+(.+)", info)
-        if not mount or not name:
-            continue
-        media_type = media.group(1).strip() if media else ""
-        if not re.search(r"BD|Blu", media_type, re.I):
-            continue
-        mount_path = mount.group(1).strip()
-        ssif_path = os.path.join(mount_path, "BDMV", "STREAM", "SSIF")
+
+        # Found a Blu-ray disc
+        ssif_path = os.path.join(bdmv, "STREAM", "SSIF")
         is_3d = os.path.isdir(ssif_path)
         print(f"[FIND_DISC] 3D check: {ssif_path} → exists={is_3d}")
-        disc = {"mount": mount_path, "name": name.group(1).strip(), "is_3d": is_3d}
-        print(f"[FIND_DISC] Found: {disc['name']} at {disc['mount']} (3D={is_3d})")
+
+        # Detect disc size (BD-25 vs BD-50) — one diskutil call for the found volume
+        disc_size_gb = 0
+        is_dual_layer = False
+        try:
+            info = subprocess.run(
+                ["diskutil", "info", vol_path],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            disc_size_match = re.search(r"Disk Size:\s+([\d.]+)\s+GB", info)
+            if disc_size_match:
+                disc_size_gb = float(disc_size_match.group(1))
+                is_dual_layer = disc_size_gb > 30  # BD-25 ≈ 25GB, BD-50 ≈ 50GB
+        except Exception:
+            pass
+
+        disc = {"mount": vol_path, "name": vol, "is_3d": is_3d,
+                "dual_layer": is_dual_layer, "size_gb": disc_size_gb}
+        print(f"[FIND_DISC] Found: {disc['name']} at {disc['mount']} (3D={is_3d}, size={disc_size_gb:.1f}GB, dual_layer={is_dual_layer})")
         return disc
-    # Fallback: check /Volumes for directories with BDMV structure
-    try:
-        for vol in os.listdir("/Volumes"):
-            vol_path = os.path.join("/Volumes", vol)
-            if not os.path.isdir(vol_path):
-                continue
-            bdmv = os.path.join(vol_path, "BDMV")
-            if os.path.isdir(bdmv) and os.path.isdir(os.path.join(bdmv, "PLAYLIST")):
-                ssif_path = os.path.join(bdmv, "STREAM", "SSIF")
-                is_3d = os.path.isdir(ssif_path)
-                print(f"[FIND_DISC] 3D check (fallback): {ssif_path} → exists={is_3d}")
-                disc = {"mount": vol_path, "name": vol, "is_3d": is_3d}
-                print(f"[FIND_DISC] Found via BDMV fallback: {disc['name']} at {disc['mount']} (3D={is_3d})")
-                return disc
-    except Exception:
-        pass
+
     print("[FIND_DISC] No Blu-ray disc found")
     return None
 
@@ -383,125 +393,33 @@ def find_disc():
 # ---------------------------------------------------------------------------
 # Scan Blu-ray titles via VLC + libbluray
 # ---------------------------------------------------------------------------
-def scan_bluray(disc, vlc_instance):
-    """Return list of tracks with idx, duration, audio, video_codec, playlist."""
+def scan_bluray(disc):
+    """Return list of tracks. Titles from libbluray (same filter as VLC), audio from MPLS."""
     print(f"[SCAN] Starting scan for {disc['name']} at {disc['mount']}")
-    mrl = f"bluray://{disc['mount']}"
-    player = vlc_instance.media_player_new()
-    media = vlc_instance.media_new(mrl)
-    media.add_option("no-bluray-menu")
-    player.set_media(media)
-    player.audio_set_volume(0)
-    player.play()
-    print("[SCAN] VLC player started, waiting for playback...")
 
-    # Wait until VLC is actually playing (BD+ init can take minutes)
-    for attempt in range(240):  # 120 seconds max
-        time.sleep(0.5)
-        state = player.get_state()
-        if state in (vlc.State.Playing, vlc.State.Paused):
-            print(f"[SCAN] VLC playing after {(attempt+1)*0.5:.1f}s")
-            break
-        if attempt % 20 == 19:
-            print(f"[SCAN] Still waiting for playback... ({(attempt+1)*0.5:.0f}s, state={state})")
-    else:
-        print(f"[SCAN] WARNING: VLC not playing after 120s (state={player.get_state()})")
+    # libbluray: get titles already filtered like VLC (bd_get_titles with TITLES_RELEVANT)
+    playlist_map = get_playlist_map(disc["mount"])
+    print(f"[SCAN] libbluray: {len(playlist_map)} titles")
 
-    # Now get titles — VLC should have them ready
-    title_descs = list(player.get_full_title_descriptions() or [])
-    if title_descs:
-        print(f"[SCAN] Found {len(title_descs)} titles")
-    else:
-        # One more try after a short wait
-        time.sleep(2)
-        title_descs = list(player.get_full_title_descriptions() or [])
-        if title_descs:
-            print(f"[SCAN] Found {len(title_descs)} titles (delayed)")
-        else:
-            print("[SCAN] WARNING: No titles found")
+    playlist_dir = os.path.join(disc["mount"], "BDMV", "PLAYLIST")
 
-    # Set first long title so audio tracks load
-    for i, td in enumerate(title_descs):
-        if td.duration > 60000:
-            print(f"[SCAN] Setting title {i} (dur={td.duration//1000}s) for audio scan")
-            player.set_title(i)
-            break
-
-    # Wait until audio tracks are fully loaded
-    audio_descs = []
-    for attempt in range(30):
-        time.sleep(0.5)
-        audio_descs = list(player.audio_get_track_description() or [])
-        if len(audio_descs) > 2:
-            print(f"[SCAN] Found {len(audio_descs)} VLC audio tracks after {(attempt+1)*0.5:.1f}s")
-            break
-
-    # Parse audio tracks
-    audio_tracks = []
-    for item in audio_descs:
-        if isinstance(item, tuple):
-            aid, aname = item
-        else:
-            aid, aname = item.id, item.name
-        if aid < 0:
-            continue
-        if isinstance(aname, bytes):
-            aname = aname.decode("utf-8", errors="replace")
-        lang_code = ""
-        if isinstance(aname, str):
-            m = re.search(r"\[(\w+)\]", aname)
-            if m:
-                lang = m.group(1).lower()
-                lang_code = LANG_MAP.get(lang, lang[:3])
-        display_name = (
-            f"{aname} [{lang_code}]" if lang_code
-            else (aname or f"Track {aid}")
-        )
-        audio_tracks.append({"id": aid, "name": display_name, "lang": lang_code})
-    print(f"[SCAN] VLC audio tracks parsed: {len(audio_tracks)}")
-
-    print("[SCAN] Stopping scan player...")
-    player.stop()
-    player.release()
-    print("[SCAN] Scan player released")
-
-    # MPLS DIE EINZIG RICHTIGE METHODE
-    print("[SCAN] Reading MPLS audio data...")
-    mpls_data = get_mpls_audio_for_disc(disc["mount"])
-    mpls_sorted = sorted(mpls_data.items(), key=lambda x: x[0])
-    print(f"[SCAN] MPLS filtered: {len(mpls_sorted)} playlists")
-    for pl_num, pl_info in mpls_sorted:
-        print(f"[SCAN]   MPLS {pl_num:05d}: dur={pl_info['duration']}s, audio={len(pl_info['audio'])}")
-
-    # Zuordnung per Dauer-Matching
+    # Build track list: idx from libbluray, audio from MPLS directly
     tracks = []
-    mpls_used = set()
-    for i, td in enumerate(title_descs):
-        dur_sec = td.duration // 1000
-        if dur_sec < 60:
-            continue
-
-        track_audio = []
-        matched_pl = None
-        for pl_num, pl_info in mpls_sorted:
-            if pl_num in mpls_used:
-                continue
-            if abs(pl_info["duration"] - dur_sec) < 5:
-                track_audio = pl_info["audio"]
-                mpls_used.add(pl_num)
-                matched_pl = pl_num
-                break
-
-        print(f"[SCAN] VLC title {i}: dur={dur_sec}s → MPLS {matched_pl}, audio={len(track_audio)}")
+    for idx, pl_num in sorted(playlist_map.items()):
+        mpls_path = os.path.join(playlist_dir, f"{pl_num:05d}.mpls")
+        dur = parse_mpls_duration(mpls_path)
+        audio = parse_mpls_audio(mpls_path)
+        print(f"[SCAN] idx={idx}: playlist {pl_num}, dur={dur}s, audio={len(audio)}")
         tracks.append({
-            "idx": i,
-            "duration": dur_sec,
-            "audio": track_audio,
-            "playlist": matched_pl,
+            "idx": idx,
+            "duration": dur,
+            "audio": audio,
+            "playlist": pl_num,
             "video_codec": "?",
         })
 
-    tracks.sort(key=lambda t: -t["duration"])
+    # Sortierung nur für Darstellung: meiste Audiospuren oben, dann längste Dauer
+    tracks.sort(key=lambda t: (-len(t["audio"]), -t["duration"]))
     print(f"[SCAN] Final track list: {len(tracks)} tracks")
     return tracks
 
@@ -520,6 +438,8 @@ class RipWorker(QThread):
     cancelled = pyqtSignal()
     error = pyqtSignal(int, str)              # idx, error_msg
 
+    eject_disc = pyqtSignal()
+
     def __init__(self, queue, mount, output_dir):
         super().__init__()
         self.queue = queue
@@ -534,27 +454,28 @@ class RipWorker(QThread):
         os.makedirs(self.output_dir, exist_ok=True)
         total = len(self.queue)
 
+        # Phase 1: Rip ALL jobs from disc → MKV
+        mkv_paths = {}  # job index → tmp mkv path
         for i, job in enumerate(self.queue):
             if self._cancel:
                 self._cleanup()
                 self.cancelled.emit()
-                self._say("Queue aborted")
                 return
 
             name = job["name"]
             self.job_started.emit(i, total, name)
-            mp4_path = os.path.join(self.output_dir, f"{name}.mp4")
+            tmp_path = f"/tmp/disc_clouder_rip_{i}.mkv" if i > 0 else TMP_MKV
 
             # Step 1: ffmpeg Disc → MKV
             self.status.emit(f"Rippe: {name}")
             self._rip_start = time.time()
             try:
-                self._rip(job)
+                self._rip(job, tmp_path)
             except Exception as e:
                 print(f"[RIP] Exception: {e}")
 
-            print(f"[RIP] Step 1 done, cancel={self._cancel}, "
-                  f"tmp exists={os.path.exists(TMP_MKV)}")
+            print(f"[RIP] Step 1 done for job {i+1}, cancel={self._cancel}, "
+                  f"tmp exists={os.path.exists(tmp_path)}")
 
             if self._cancel:
                 self._cleanup()
@@ -562,61 +483,82 @@ class RipWorker(QThread):
                 self._say("Queue aborted")
                 return
 
-            # Step 2: ffmpeg MKV → MP4 — ALWAYS if temp file exists
-            if os.path.exists(TMP_MKV):
-                self.status.emit(f"Konvertiere: {name}")
-                self._convert_start = time.time()
-                print(f"[STEP2] Starting convert: {TMP_MKV} → {mp4_path}")
-                try:
-                    self._convert(TMP_MKV, mp4_path)
-                except Exception as e:
-                    print(f"[CONVERT] Exception: {e}")
-                    self.error.emit(i, f"Konvertierung: {e}")
-                    self._cleanup()
-                    self._say(f"{name} failed")
-                    continue
+            if os.path.exists(tmp_path):
+                mkv_paths[i] = tmp_path
             else:
-                print(f"[ERROR] Temp file not found: {TMP_MKV}")
+                print(f"[ERROR] Temp file not found: {tmp_path}")
                 self.error.emit(i, "Rip fehlgeschlagen — keine Datei")
-                self._say(f"{name} failed")
+
+        # Disc no longer needed — eject!
+        print("[RIP] All disc rips done — ejecting disc")
+        self.eject_disc.emit()
+
+        # Phase 2: Convert ALL MKVs → MP4 (disc-free)
+        for i, job in enumerate(self.queue):
+            if self._cancel:
+                self._cleanup()
+                self.cancelled.emit()
+                return
+
+            if i not in mkv_paths:
+                continue
+
+            name = job["name"]
+            mp4_path = os.path.join(self.output_dir, f"{name}.mp4")
+            tmp_path = mkv_paths[i]
+
+            self.status.emit(f"Konvertiere: {name}")
+            self._convert_start = time.time()
+            print(f"[STEP2] Starting convert: {tmp_path} → {mp4_path}")
+            try:
+                self._convert(tmp_path, mp4_path)
+            except Exception as e:
+                print(f"[CONVERT] Exception: {e}")
+                self.error.emit(i, f"Konvertierung: {e}")
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
                 continue
 
             if self._cancel:
-                self._cleanup()
                 try:
                     os.remove(mp4_path)
+                    os.remove(tmp_path)
                 except OSError:
                     pass
+                self._cleanup()
                 self.cancelled.emit()
-                self._say("Queue aborted")
                 return
 
-            self._cleanup()
+            # Clean up tmp MKV after successful convert
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
             self.job_finished.emit(i, mp4_path)
             self._say(f"{name} complete")
 
+        self._cleanup()
         self.all_finished.emit()
 
     def _say(self, text):
         subprocess.run(["say", text], capture_output=True)
 
     def _cleanup(self):
-        for f in [TMP_MKV, TMP_THUMB, "/tmp/disc_clouder_concat.txt"]:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-        # Clean up any part files
         import glob
-        for f in glob.glob(f"{TMP_MKV}.part*.mkv"):
-            try:
-                os.remove(f)
-            except OSError:
-                pass
-        try:
-            os.remove(TMP_MKV + ".merged.mkv")
-        except OSError:
-            pass
+        for pattern in [
+            "/tmp/disc_clouder_rip*.mkv",
+            "/tmp/disc_clouder_rip*.mkv.part*.mkv",
+            "/tmp/disc_clouder_rip*.mkv.merged.mkv",
+            "/tmp/disc_clouder_thumb.jpg",
+            "/tmp/disc_clouder_concat.txt",
+        ]:
+            for f in glob.glob(pattern):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
     def _extract_thumb(self, src_path, sec):
         """Extract a frame from the growing MKV for thumbnail."""
@@ -640,9 +582,11 @@ class RipWorker(QThread):
         except Exception:
             pass
 
-    def _rip(self, job):
+    def _rip(self, job, out_path=None):
         """Disc → MKV via ffmpeg — ALL audio tracks in one pass.
         Retries endlessly on failure (resume with -ss) until complete or cancelled."""
+        if out_path is None:
+            out_path = TMP_MKV
         duration = job["duration"]
         playlist = job.get("playlist")
         video_codec = job.get("video_codec", "?")
@@ -662,12 +606,21 @@ class RipWorker(QThread):
             audio_idx = job.get("audio_idx", 0)
             all_audio = [{"idx": audio_idx, "lang": job.get("audio_lang", "und"), "label": "?"}]
 
+        # Dual-layer detection — limit read speed to avoid layer-switch hang
+        is_dual_layer = job.get("dual_layer", False)
+        bd50_readrate = 2 if is_dual_layer else None
+        if is_dual_layer:
+            print(f"[RIP] Dual-layer disc (BD-50) — readrate limited to 2x")
+
         # Build base command (without -ss and output)
         def build_cmd(start_sec=0):
             cmd = [
                 "ffmpeg", "-y",
+                "-analyzeduration", "20000000", "-probesize", "50000000",
                 "-err_detect", "ignore_err", "-max_error_rate", "1.0",
             ]
+            if bd50_readrate:
+                cmd += ["-readrate", str(bd50_readrate)]
             if start_sec > 0:
                 cmd += ["-ss", str(start_sec)]
             if playlist is not None:
@@ -688,10 +641,12 @@ class RipWorker(QThread):
         parts = []
         total_reached = 0
         attempt = 0
+        self._chunk_mode = False
 
         while total_reached < duration - 5 and not self._cancel:
             attempt += 1
-            part_path = TMP_MKV if total_reached == 0 else f"{TMP_MKV}.part{len(parts)+1}.mkv"
+            part_path = out_path if total_reached == 0 else f"{out_path}.part{len(parts)+1}.mkv"
+
             cmd = build_cmd(start_sec=total_reached)
             cmd += ["-progress", "pipe:1", part_path]
 
@@ -703,53 +658,219 @@ class RipWorker(QThread):
 
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL, text=True,
+                stdin=subprocess.DEVNULL,
             )
+
+            import select, fcntl, os as _os
+            # Make stdout non-blocking so os.read() never hangs
+            fd = proc.stdout.fileno()
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | _os.O_NONBLOCK)
+
+            STALL_TIMEOUT = 10  # seconds without progress → kill & retry
+            CHUNK_DURATION = 300  # 5 minutes of film per chunk — proactive revoke
+            CHUNK_PAUSE = 30  # seconds pause between chunks
+            SLOW_INIT_THRESHOLD = 30  # seconds — if first progress takes longer, enable chunking
 
             last_sec = total_reached
             last_pct = -1
-            for line in proc.stdout:
+            last_progress_time = time.time()
+            chunk_start_sec = total_reached  # track how far this chunk has gone
+            first_progress_time = None  # when first out_time_ms arrived
+            chunk_mode = getattr(self, '_chunk_mode', False)  # persists across retries
+            buf = ""
+            poll_count = 0
+            print(f"[RIP] Entering select() loop, fd={fd}, pid={proc.pid}")
+
+            # Filesize watchdog — separate thread monitors output file
+            _watchdog_triggered = threading.Event()
+            def _filesize_watchdog():
+                last_size = -1
+                last_change = time.time()
+                while proc.poll() is None and not self._cancel and not _watchdog_triggered.is_set():
+                    try:
+                        sz = os.path.getsize(part_path)
+                    except OSError:
+                        sz = 0
+                    if sz != last_size:
+                        last_size = sz
+                        last_change = time.time()
+                    elif time.time() - last_change >= STALL_TIMEOUT:
+                        print(f"[WATCHDOG] File size stall: {sz} bytes unchanged for {STALL_TIMEOUT}s — killing ffmpeg {proc.pid}")
+                        _watchdog_triggered.set()
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                        return
+                    time.sleep(2)
+            watchdog_thread = threading.Thread(target=_filesize_watchdog, daemon=True)
+            watchdog_thread.start()
+
+            while True:
                 if self._cancel:
+                    _watchdog_triggered.set()
                     proc.kill()
                     proc.wait()
                     return
-                line = line.strip()
-                if line.startswith("out_time_ms="):
+
+                # Wait for data with timeout (5s poll)
+                ready, _, _ = select.select([proc.stdout], [], [], 5.0)
+                poll_count += 1
+                if ready:
                     try:
-                        current_sec = total_reached + int(line.split("=")[1]) // 1_000_000
-                        if current_sec > last_sec:
-                            last_sec = current_sec
-                            self.progress_rip.emit(current_sec, duration)
-                            pct = (current_sec * 100) // duration if duration > 0 else 0
-                            if pct != last_pct and current_sec > 5:
-                                last_pct = pct
-                                self._extract_thumb(part_path, current_sec - 2)
-                    except ValueError:
-                        pass
-            proc.wait()
+                        raw = _os.read(fd, 8192)
+                    except OSError as e:
+                        print(f"[RIP] os.read() OSError: {e}")
+                        raw = b""
+                    if not raw:
+                        print(f"[RIP] EOF on stdout (poll #{poll_count})")
+                        break  # EOF — ffmpeg exited
+                    buf += raw.decode("utf-8", errors="replace")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        line = line.strip()
+                        if line.startswith("out_time_ms="):
+                            try:
+                                current_sec = total_reached + int(line.split("=")[1]) // 1_000_000
+                                if current_sec > last_sec:
+                                    last_sec = current_sec
+                                    last_progress_time = time.time()
+                                    self.progress_rip.emit(current_sec, duration)
+                                    # Detect slow disc on first progress
+                                    if first_progress_time is None:
+                                        init_time = time.time() - last_progress_time + 5  # approx
+                                        first_progress_time = time.time()
+                                        if not chunk_mode and attempt == 1:
+                                            # Use scan time from disc insertion
+                                            if getattr(self, '_slow_disc', False):
+                                                chunk_mode = True
+                                                self._chunk_mode = True
+                                                print(f"[RIP] Slow disc (scan took >30s) — chunk mode ON")
+                                            else:
+                                                print(f"[RIP] Fast disc — chunk mode OFF")
+                                    pct = (current_sec * 100) // duration if duration > 0 else 0
+                                    if pct != last_pct and current_sec > 5:
+                                        last_pct = pct
+                                        self._extract_thumb(part_path, current_sec - 2)
+                            except ValueError:
+                                pass
+                            # Proactive chunk revoke — kill after CHUNK_DURATION of progress
+                            if chunk_mode and last_sec - chunk_start_sec >= CHUNK_DURATION:
+                                print(f"[RIP] Chunk done: {chunk_start_sec}s → {last_sec}s ({CHUNK_DURATION}s) — proactive revoke")
+                                self.status.emit(f"Laufwerk-Pause ({CHUNK_PAUSE}s)...")
+                                try:
+                                    proc.kill()
+                                except OSError:
+                                    pass
+                                try:
+                                    proc.wait(timeout=15)
+                                except subprocess.TimeoutExpired:
+                                    try:
+                                        _os.kill(proc.pid, 9)
+                                    except OSError:
+                                        pass
+                                    try:
+                                        proc.wait(timeout=15)
+                                    except subprocess.TimeoutExpired:
+                                        print(f"[RIP] ffmpeg PID {proc.pid} stuck — abandoning")
+                                break
+                        elif line:
+                            last_progress_time = time.time()
+                else:
+                    # Timeout — check if stalled too long
+                    stall = time.time() - last_progress_time
+                    print(f"[RIP] select() timeout #{poll_count}: stall={int(stall)}s, pid={proc.pid}, poll={proc.poll()}")
+                    if stall >= STALL_TIMEOUT:
+                        print(f"[RIP] Stall detected: no progress for {int(stall)}s — killing ffmpeg")
+                        self.status.emit(f"Disc-Lesefehler — Retry...")
+                        try:
+                            proc.kill()
+                        except OSError:
+                            pass
+                        try:
+                            proc.wait(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                _os.kill(proc.pid, 9)
+                            except OSError:
+                                pass
+                            try:
+                                proc.wait(timeout=15)
+                            except subprocess.TimeoutExpired:
+                                # Process stuck in kernel I/O — abandon it
+                                print(f"[RIP] ffmpeg PID {proc.pid} stuck in kernel — abandoning")
+                        break
+
+                # Check if process exited or watchdog killed it
+                if proc.poll() is not None or _watchdog_triggered.is_set():
+                    if _watchdog_triggered.is_set():
+                        print(f"[RIP] Watchdog killed ffmpeg — breaking out of select loop")
+                    break
+
+            # Stop watchdog
+            _watchdog_triggered.set()
+
+            # Don't block forever on zombie processes
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                print(f"[RIP] ffmpeg PID {proc.pid} won't die — moving on")
 
             # Check how far this part got
             part_dur = self._get_mkv_duration(part_path)
+            if part_dur <= 0 and os.path.exists(part_path) and os.path.getsize(part_path) > 1_000_000:
+                # File exists but duration unreadable (killed ffmpeg = broken container)
+                # Repair by remuxing
+                repaired = part_path + ".repaired.mkv"
+                print(f"[RIP] Repairing broken MKV ({os.path.getsize(part_path) // 1_000_000}MB)...")
+                try:
+                    subprocess.run(
+                        [FFMPEG, "-y", "-i", part_path, "-c", "copy", repaired],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=120,
+                    )
+                    if os.path.exists(repaired):
+                        os.replace(repaired, part_path)
+                        part_dur = self._get_mkv_duration(part_path)
+                        print(f"[RIP] Repaired OK, duration={part_dur}s")
+                except (subprocess.TimeoutExpired, OSError) as e:
+                    print(f"[RIP] Repair failed: {e}")
+                    try:
+                        os.remove(repaired)
+                    except OSError:
+                        pass
+
             if part_dur > 0:
                 parts.append(part_path)
                 total_reached += part_dur
                 print(f"[RIP] Part {attempt} done: {part_dur}s, total={total_reached}s/{duration}s")
+                if total_reached < duration - 5:
+                    # Shorter pause for proactive chunk revoke, longer for stall recovery
+                    is_chunk_revoke = part_dur >= CHUNK_DURATION - 10
+                    wait = CHUNK_PAUSE if is_chunk_revoke else 120
+                    print(f"[RIP] Waiting {wait}s ({'chunk revoke' if is_chunk_revoke else 'stall recovery'})...")
+                    self.status.emit(f"Laufwerk-Pause ({wait}s)...")
+                    for w in range(wait):
+                        if self._cancel:
+                            break
+                        time.sleep(1)
             else:
                 print(f"[RIP] Part {attempt} produced no output, retrying...")
-                # Fallback: if copy produced 0 bytes, switch to transcode
-                if v_codec == ["-c:v", "copy"]:
+                # Only switch codec if this is the FIRST attempt (not a layer-switch retry)
+                if attempt == 1 and v_codec == ["-c:v", "copy"]:
                     print("[RIP] Fallback: switching from -c:v copy to h264_videotoolbox")
                     v_codec = ["-c:v", "h264_videotoolbox", "-q:v", "50"]
                 time.sleep(2)  # Brief pause before retry
 
-        # Safety: if only 1 part and it's not TMP_MKV, rename it
-        if len(parts) == 1 and parts[0] != TMP_MKV:
+        # Safety: if only 1 part and it's not out_path, rename it
+        if len(parts) == 1 and parts[0] != out_path:
             try:
-                os.remove(TMP_MKV)
+                os.remove(out_path)
             except OSError:
                 pass
-            os.rename(parts[0], TMP_MKV)
-            print(f"[RIP] Renamed {parts[0]} → {TMP_MKV}")
+            os.rename(parts[0], out_path)
+            print(f"[RIP] Renamed {parts[0]} → {out_path}")
 
         # If multiple parts, concatenate them
         if len(parts) > 1:
@@ -759,24 +880,24 @@ class RipWorker(QThread):
             with open(concat_list, "w") as f:
                 for p in parts:
                     f.write(f"file '{p}'\n")
+            merged_path = out_path + ".merged.mkv"
             concat_cmd = [
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", concat_list, "-c", "copy", TMP_MKV + ".merged.mkv",
+                "-i", concat_list, "-c", "copy", merged_path,
             ]
             print(f"[RIP] concat cmd: {' '.join(concat_cmd)}")
             subprocess.run(concat_cmd, capture_output=True)
-            # Replace TMP_MKV with merged file
             for p in parts:
-                if p != TMP_MKV:
+                if p != out_path:
                     try:
                         os.remove(p)
                     except OSError:
                         pass
             try:
-                os.remove(TMP_MKV)
+                os.remove(out_path)
             except OSError:
                 pass
-            os.rename(TMP_MKV + ".merged.mkv", TMP_MKV)
+            os.rename(merged_path, out_path)
             try:
                 os.remove(concat_list)
             except OSError:
@@ -862,6 +983,7 @@ class DiscClouder(QMainWindow):
         self.rip_worker = None
         self._seeking = False
         self._title_set_by_user = False
+        self._vlc_busy = False  # guard against VLC deadlock
 
         self._build_ui()
         self._connect_signals()
@@ -871,13 +993,7 @@ class DiscClouder(QMainWindow):
         self.pos_timer.timeout.connect(self._update_position)
 
         self._scanning = False
-        self._last_volumes = set(os.listdir("/Volumes"))  # Init with current state
-        QTimer.singleShot(500, self._scan_disc)
-
-        self.disc_poll_timer = QTimer()
-        self.disc_poll_timer.setInterval(3000)
-        self.disc_poll_timer.timeout.connect(self._check_for_new_disc)
-        self.disc_poll_timer.start()
+        QTimer.singleShot(500, self._initial_scan)
 
     # =====================================================================
     # UI
@@ -1124,8 +1240,12 @@ class DiscClouder(QMainWindow):
         self.btn_clear_queue.clicked.connect(self._clear_queue)
         self.btn_cancel.clicked.connect(self._cancel_rip)
         self.track_tree.itemClicked.connect(self._on_track_clicked)
-        self.seek_slider.sliderPressed.connect(
-            lambda: setattr(self, '_seeking', True)
+        def _on_slider_pressed():
+            print(f"[SEEK] Slider pressed at {time.strftime('%H:%M:%S')}")
+            self._seeking = True
+        self.seek_slider.sliderPressed.connect(_on_slider_pressed)
+        self.seek_slider.valueChanged.connect(
+            lambda v: print(f"[SEEK] Slider moved to {v/10:.1f}%") if self._seeking else None
         )
         self.seek_slider.sliderReleased.connect(self._seek_end)
         self.scan_done.connect(self._on_scan_done)
@@ -1136,45 +1256,33 @@ class DiscClouder(QMainWindow):
     # Title field
     # =====================================================================
     def _on_title_edited(self, text):
+        print(f"[UI] Title edited: '{text}'")
         self._title_set_by_user = True
 
     # =====================================================================
     # Disc scanning
     # =====================================================================
-    def _check_for_new_disc(self):
-        if self._scanning:
-            return
-        if self.rip_worker and self.rip_worker.isRunning():
-            return
-        try:
-            current = set(os.listdir("/Volumes"))
-        except OSError:
-            return
-        if current != self._last_volumes:
-            added = current - self._last_volumes
-            removed = self._last_volumes - current
-            print(f"[POLL] Volumes changed: {added} added, {removed} removed")
-            self._last_volumes = current
-            if added:
-                # Wait for disc to be fully mounted before scanning
-                def _wait_and_scan():
-                    for vol in added:
-                        mount = f"/Volumes/{vol}"
-                        bdmv = os.path.join(mount, "BDMV", "index.bdmv")
-                        print(f"[POLL] Waiting for disc ready at {mount}...")
-                        for _ in range(30):  # Max 30 seconds
-                            if os.path.exists(bdmv):
-                                print(f"[POLL] Disc ready: {bdmv} found")
-                                break
-                            time.sleep(1)
-                        else:
-                            print(f"[POLL] No BDMV found at {mount}, scanning anyway")
-                    # Schedule scan on main thread
-                    QTimer.singleShot(0, self._scan_disc)
-                threading.Thread(target=_wait_and_scan, daemon=True).start()
-            else:
-                # Volume removed — scan immediately
-                self._scan_disc()
+    def _initial_scan(self):
+        """On startup: scan once. If no disc found, show dialog."""
+        self._disc_insert_time = time.time()
+        disc = find_disc()
+        if disc:
+            self._scan_disc()
+        else:
+            self._prompt_insert_disc()
+
+    def _prompt_insert_disc(self):
+        """Show dialog asking user to insert a Blu-ray disc."""
+        reply = QMessageBox.question(
+            self, "Keine Blu-ray gefunden",
+            "Bitte Blu-ray einlegen und OK drücken.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Ok:
+            self._disc_insert_time = time.time()
+            self._scan_disc()
+        else:
+            self.lbl_status.setText("Kein Scan — 'Neu scannen' drücken wenn bereit")
 
     def _scan_disc(self, reset_title=False):
         if self._scanning:
@@ -1183,17 +1291,8 @@ class DiscClouder(QMainWindow):
         self._scanning = True
         print(f"[SCAN_DISC] Starting scan (reset_title={reset_title})")
         self.lbl_status.setText("Scanne...")
-        # Stop player in background thread to avoid Main Thread hang
-        # (VLC input_Close can deadlock on BD+ discs)
-        def _stop():
-            try:
-                self.vlc_player.stop()
-                self.vlc_player.set_media(None)
-            except Exception:
-                pass
-        t = threading.Thread(target=_stop, daemon=True)
-        t.start()
-        t.join(timeout=3)  # Max 3 seconds, then proceed anyway
+        # Stop player via safe method (avoids GIL deadlock)
+        self._vlc_stop(release_media=True)
         self.tracks = []
         self.track_tree.clear()
         if reset_title:
@@ -1206,13 +1305,23 @@ class DiscClouder(QMainWindow):
                 self.scan_done.emit([])
                 return
             self.disc = disc
-            tracks = scan_bluray(disc, self.vlc_instance)
+            tracks = scan_bluray(disc)
             self.scan_done.emit(tracks)
 
         threading.Thread(target=_do, daemon=True).start()
 
     def _on_scan_done(self, tracks):
         self._scanning = False
+        self._ejecting = False
+        self.btn_eject.setEnabled(True)
+        # Measure disc scan time
+        insert_time = getattr(self, '_disc_insert_time', None)
+        if insert_time and len(tracks) > 0:
+            scan_duration = time.time() - insert_time
+            self._slow_disc = scan_duration > 30
+            print(f"[SCAN_DONE] Disc scan took {scan_duration:.1f}s — {'SLOW disc' if self._slow_disc else 'fast disc'}")
+        else:
+            self._slow_disc = False
         print(f"[SCAN_DONE] Received {len(tracks)} tracks, disc={self.disc}")
         self.tracks = tracks
         if not self.disc:
@@ -1221,6 +1330,7 @@ class DiscClouder(QMainWindow):
             self.lbl_status.setText("")
             self.audio_list.clear()
             self.track_tree.clear()
+            self._prompt_insert_disc()
             return
 
         self.lbl_disc.setText(self.disc["name"])
@@ -1249,29 +1359,25 @@ class DiscClouder(QMainWindow):
             )
             return
 
-        for t in tracks:
+        for row_idx, t in enumerate(tracks):
             dur = t["duration"]
             dur_str = f"{dur // 60}:{dur % 60:02d}"
             item = QTreeWidgetItem([
-                str(t["idx"]),
+                str(row_idx),
                 dur_str,
                 t.get("video_codec", "?"),
                 f"{len(t['audio'])} Spuren",
             ])
+            item.setData(0, Qt.ItemDataRole.UserRole, row_idx)
             self.track_tree.addTopLevelItem(item)
 
         for i in range(4):
             self.track_tree.resizeColumnToContents(i)
 
-        # Set up preview player
-        print(f"[SCAN_DONE] Setting up preview player for {self.disc['mount']}")
-        mrl = f"bluray://{self.disc['mount']}"
-        media = self.vlc_instance.media_new(mrl)
-        media.add_option("no-bluray-menu")
-        self.vlc_player.set_media(media)
-        self.vlc_player.set_nsobject(int(self.video_widget.winId()))
-        self.vlc_player.audio_set_volume(self.vol_slider.value())
-        print("[SCAN_DONE] Preview player ready")
+        # Preview player — attach to video widget, media set on track click only
+        if not self.vlc_player.get_nsobject():
+            self.vlc_player.set_nsobject(int(self.video_widget.winId()))
+        print("[SCAN_DONE] Ready — select a track to preview")
 
         self.lbl_status.setText(f"{len(tracks)} Titel gefunden")
 
@@ -1279,19 +1385,33 @@ class DiscClouder(QMainWindow):
     # Track selection + Preview
     # =====================================================================
     def _on_track_clicked(self, item, col):
-        idx = int(item.text(0))
-        track = next((t for t in self.tracks if t["idx"] == idx), None)
+        row_idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if row_idx is None or row_idx >= len(self.tracks):
+            return
+        track = self.tracks[row_idx]
+        idx = track["idx"]  # VLC title index
         if not track:
             print(f"[TRACK_CLICK] Track idx={idx} not found in tracks list!")
             return
 
         print(f"[TRACK_CLICK] Clicked track idx={idx}, dur={track['duration']}s, audio={len(track['audio'])}")
+        if self._vlc_busy:
+            print("[TRACK_CLICK] VLC busy, ignoring")
+            return
+
+        # Set media if not yet set
+        if not self.vlc_player.get_media():
+            mrl = f"bluray://{self.disc['mount']}"
+            media = self.vlc_instance.media_new(mrl)
+            media.add_option("no-bluray-menu")
+            self.vlc_player.set_media(media)
+            print(f"[TRACK_CLICK] Media set: {mrl}")
+
         self.vlc_player.play()
         self.pos_timer.start()
         self.btn_play.setText("Pause")
 
-        # Run VLC title switch in background to avoid Main Thread hang
-        # (VLC input_Close can deadlock on BD+ discs)
+        # Run VLC title switch in background
         def _load_title():
             print(f"[LOAD_TITLE] Background: setting title {idx}...")
             time.sleep(0.5)
@@ -1351,6 +1471,7 @@ class DiscClouder(QMainWindow):
 
     def _on_track_loaded(self, idx):
         """Update UI after background title load (video codec)."""
+        print(f"[TRACK_LOADED] idx={idx}")
         track = next((t for t in self.tracks if t["idx"] == idx), None)
         if not track:
             return
@@ -1362,27 +1483,61 @@ class DiscClouder(QMainWindow):
                 break
 
     # =====================================================================
+    # VLC safe stop — prevents GIL deadlock
+    # =====================================================================
+    def _vlc_stop(self, release_media=False, callback=None):
+        """Stop VLC in background thread to avoid GIL deadlock with input_Close.
+        Optional callback runs on main thread after stop completes."""
+        if self._vlc_busy:
+            print("[VLC] Already busy, skipping stop")
+            if callback:
+                callback()
+            return
+        self._vlc_busy = True
+        print("[VLC] Stopping (background)...")
+        def _bg():
+            try:
+                self.vlc_player.stop()
+                if release_media:
+                    self.vlc_player.set_media(None)
+                print("[VLC] Stopped OK")
+            except Exception as e:
+                print(f"[VLC] Stop error: {e}")
+            self._vlc_busy = False
+            if callback:
+                QTimer.singleShot(0, callback)
+        threading.Thread(target=_bg, daemon=True).start()
+
+    # =====================================================================
     # Player controls
     # =====================================================================
     def _toggle_play(self):
+        if self._vlc_busy:
+            print("[PLAY] VLC busy, ignoring")
+            return
         state = self.vlc_player.get_state()
         print(f"[PLAY] Toggle play, state={state}")
         if state == vlc.State.Playing:
+            print("[PLAY] Pausing...")
             self.vlc_player.pause()
+            print("[PLAY] Paused")
             self.btn_play.setText("Play")
         else:
+            print("[PLAY] Playing...")
             self.vlc_player.play()
+            print("[PLAY] Play started")
             self.vlc_player.audio_set_volume(self.vol_slider.value())
             self.btn_play.setText("Pause")
             self.pos_timer.start()
 
     def _stop_player(self):
         print("[STOP] Stopping player")
-        self.vlc_player.stop()
         self.pos_timer.stop()
         self.btn_play.setText("Play")
         self.lbl_time.setText("00:00 / 00:00")
         self.seek_slider.setValue(0)
+        self._vlc_stop()
+        print("[STOP] Done")
 
     def _update_position(self):
         if self._seeking:
@@ -1406,7 +1561,18 @@ class DiscClouder(QMainWindow):
         self._seeking = False
         val = self.seek_slider.value()
         length = self.vlc_player.get_length() or 1
-        self.vlc_player.set_time(int(val * length / 1000))
+        target_ms = int(val * length / 1000)
+        print(f"[SEEK] Slider released at {time.strftime('%H:%M:%S')} → seeking to {target_ms//1000}s ({val/10:.1f}%)")
+        self.vlc_player.set_time(target_ms)
+        print(f"[SEEK] set_time done")
+        # Restore selected audio track after seek (VLC resets it)
+        if hasattr(self, '_current_vlc_audio_track'):
+            def _restore():
+                time.sleep(0.3)
+                print(f"[SEEK] Restoring audio track {self._current_vlc_audio_track}")
+                self.vlc_player.audio_set_track(self._current_vlc_audio_track)
+                print(f"[SEEK] Audio track restored")
+            threading.Thread(target=_restore, daemon=True).start()
 
     def _on_audio_clicked(self, item, col):
         """
@@ -1469,17 +1635,40 @@ class DiscClouder(QMainWindow):
                 else:
                     print(f"[AUDIO] ✓ Included: {lang}")
 
-        # Switch preview player to clicked audio
-        if row >= 0:
+        # Switch preview player to clicked audio — match MPLS lang to VLC track ID
+        if row >= 0 and a_data:
+            target_lang = a_data.get('lang', '')
+            target_equiv = LANG_EQUIV.get(target_lang, '')
             all_tracks = list(self.vlc_player.audio_get_track_description() or [])
-            valid = [
-                (a[0] if isinstance(a, tuple) else a.id)
-                for a in all_tracks
-                if (a[0] if isinstance(a, tuple) else a.id) >= 0
-            ]
-            if row < len(valid):
-                self.vlc_player.audio_set_track(valid[row])
-                print(f"[AUDIO] Player switched to track {valid[row]}")
+            # Count how many times this language appeared before this row (for duplicates)
+            same_lang_before = 0
+            for r in range(row):
+                prev = self.audio_list.topLevelItem(r)
+                if prev:
+                    pd = prev.data(0, Qt.ItemDataRole.UserRole)
+                    if pd and pd.get('lang') == target_lang:
+                        same_lang_before += 1
+            # Find the Nth VLC track matching this language
+            match_count = 0
+            for a in all_tracks:
+                aid = a[0] if isinstance(a, tuple) else a.id
+                aname = a[1] if isinstance(a, tuple) else a.name
+                if aid < 0:
+                    continue
+                if isinstance(aname, bytes):
+                    aname = aname.decode("utf-8", errors="replace")
+                vlc_lang = ""
+                if isinstance(aname, str):
+                    m = re.search(r"\[(\w+)\]", aname)
+                    if m:
+                        vlc_lang = LANG_MAP.get(m.group(1).lower(), m.group(1).lower()[:3])
+                if vlc_lang and (vlc_lang == target_lang or vlc_lang == target_equiv):
+                    if match_count == same_lang_before:
+                        self.vlc_player.audio_set_track(aid)
+                        self._current_vlc_audio_track = aid
+                        print(f"[AUDIO] Player switched to track {aid} ({target_lang}→{vlc_lang}, match #{match_count})")
+                        break
+                    match_count += 1
 
     # =====================================================================
     # Queue management
@@ -1548,6 +1737,7 @@ class DiscClouder(QMainWindow):
             "duration": track["duration"],
             "video_codec": track.get("video_codec", "?"),
             "mode_3d": mode_3d,
+            "dual_layer": self.disc.get("dual_layer", False) if self.disc else False,
         }
         print(f"[QUEUE] Job: name='{name}', idx={idx}, audio={[(a['idx'], a['lang'], a['label']) for a in all_audio]}, dur={track['duration']}s, mode_3d={mode_3d_names.get(mode_3d, '?')}")
         self.queue.append(job)
@@ -1600,8 +1790,15 @@ class DiscClouder(QMainWindow):
 
         output_dir = self.edit_output.text().strip() or DEFAULT_OUTPUT
 
-        # Stop preview player
-        self.vlc_player.stop()
+        # Stop preview player AND release disc completely — WAIT until done
+        self._vlc_stop(release_media=True)
+        # Wait for VLC to actually stop before starting ffmpeg
+        for _ in range(50):  # max 5 seconds
+            if not self._vlc_busy:
+                break
+            time.sleep(0.1)
+        else:
+            print("[RIP_START] WARNING: VLC stop timed out, starting anyway")
         self.pos_timer.stop()
         self.btn_play.setText("Play")
 
@@ -1625,6 +1822,7 @@ class DiscClouder(QMainWindow):
             mount=self.disc["mount"],
             output_dir=output_dir,
         )
+        self.rip_worker._slow_disc = getattr(self, '_slow_disc', False)
         self.rip_worker.progress_rip.connect(self._on_rip_progress)
         self.rip_worker.progress_convert.connect(self._on_convert_progress)
         self.rip_worker.thumbnail.connect(self._on_thumbnail)
@@ -1634,6 +1832,7 @@ class DiscClouder(QMainWindow):
         self.rip_worker.all_finished.connect(self._on_all_finished)
         self.rip_worker.cancelled.connect(self._on_cancelled)
         self.rip_worker.error.connect(self._on_rip_error)
+        self.rip_worker.eject_disc.connect(self._auto_eject)
         self.rip_worker.start()
 
     def _on_job_started(self, idx, total, name):
@@ -1736,31 +1935,99 @@ class DiscClouder(QMainWindow):
             self.rip_worker.cancel()
 
     def _on_cancelled(self):
-        print("[RIP] Cancelled")
-        self._restore_after_rip()
+        print("[RIP] Cancelled — ejecting and cleaning up")
+        def _bg():
+            subprocess.run(["drutil", "eject"], capture_output=True)
+            subprocess.run(["say", "Queue aborted"], capture_output=True)
+        threading.Thread(target=_bg, daemon=True).start()
         self.queue.clear()
         self.queue_tree.clear()
         self.lbl_status.setText("Abgebrochen")
+        self._restore_after_rip()
+
+    def _cleanup_tmp(self):
+        """Remove all disc_clouder temp files."""
+        import glob
+        for pattern in [
+            "/tmp/disc_clouder_rip*.mkv",
+            "/tmp/disc_clouder_rip*.mkv.part*.mkv",
+            "/tmp/disc_clouder_rip*.mkv.merged.mkv",
+            "/tmp/disc_clouder_thumb.jpg",
+            "/tmp/disc_clouder_concat.txt",
+        ]:
+            for f in glob.glob(pattern):
+                try:
+                    os.remove(f)
+                    print(f"[CLEANUP] Removed {f}")
+                except OSError:
+                    pass
+
+    def _auto_eject(self):
+        """Eject disc automatically after all rips are done (disc no longer needed)."""
+        print("[AUTO_EJECT] Disc no longer needed — ejecting")
+        def _bg():
+            subprocess.run(["drutil", "eject"], capture_output=True)
+            print("[AUTO_EJECT] Ejected")
+        threading.Thread(target=_bg, daemon=True).start()
+        self.disc = None
+        self.tracks = []
 
     def _restore_after_rip(self):
-        print("[RESTORE] Restoring after rip")
+        """Reset app to fresh state — as if just launched."""
+        print("[RESTORE] Resetting to fresh state")
+        # UI zurück
         self.stack.setCurrentIndex(0)
-        self.tabs.setCurrentIndex(0)  # Switch to Titel tab
+        self.tabs.setCurrentIndex(0)
         self.lbl_thumb.clear()
         self.btn_scan.setVisible(True)
         self.btn_eject.setVisible(True)
+        self.btn_eject.setEnabled(True)
+        # State zurück
+        self.disc = None
+        self.tracks = []
+        self.rip_worker = None
         self._title_set_by_user = False
-        self._scan_disc()
+        self._seeking = False
+        self._vlc_busy = False
+        self._ejecting = False
+        self._chunk_mode = False
+        # UI leeren
+        self.track_tree.clear()
+        self.audio_list.clear()
+        self.edit_base_title.clear()
+        self.edit_suffix.clear()
+        self.lbl_disc.setText("Keine Disc — bitte einlegen")
+        self.lbl_type.setText("")
+        self.lbl_time.setText("00:00 / 00:00")
+        self.seek_slider.setValue(0)
+        self.bar_rip.setValue(0)
+        self.bar_convert.setValue(0)
+        self.lbl_rip_stats.setText("")
+        self.lbl_convert_stats.setText("")
+        self.btn_play.setText("Play")
+        self.pos_timer.stop()
+        # VLC komplett freigeben
+        self._vlc_stop(release_media=True)
+        # Temp-Dateien aufräumen
+        self._cleanup_tmp()
+        print("[RESTORE] Fresh state ready — waiting for disc")
 
     # =====================================================================
     # Eject
     # =====================================================================
     def _eject(self):
+        if getattr(self, '_ejecting', False):
+            return
+        self._ejecting = True
+        self._scanning = False
+        self.btn_eject.setEnabled(False)
         print("[EJECT] Ejecting disc")
-        self.vlc_player.stop()
-        self.vlc_player.set_media(None)
-        time.sleep(0.5)
-        subprocess.run(["drutil", "eject"], capture_output=True)
+        def _after_vlc_stop():
+            print("[EJECT] VLC stopped, ejecting...")
+            subprocess.run(["drutil", "eject"], capture_output=True)
+            print("[EJECT] Eject done")
+            self._ejecting = False
+        self._vlc_stop(release_media=True, callback=_after_vlc_stop)
         self.disc = None
         self.tracks = []
         self.track_tree.clear()
@@ -1778,8 +2045,11 @@ class DiscClouder(QMainWindow):
     # =====================================================================
     def closeEvent(self, event):
         print("[EXIT] Closing app")
-        self.vlc_player.stop()
-        self.vlc_player.set_media(None)
+        try:
+            self.vlc_player.stop()
+            self.vlc_player.set_media(None)
+        except Exception:
+            pass
         if self.rip_worker and self.rip_worker.isRunning():
             self.rip_worker.cancel()
         event.accept()
@@ -1788,7 +2058,26 @@ class DiscClouder(QMainWindow):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _startup_cleanup():
+    """Remove leftover temp files from previous runs."""
+    import glob
+    for pattern in [
+        "/tmp/disc_clouder_rip*.mkv",
+        "/tmp/disc_clouder_rip*.mkv.part*.mkv",
+        "/tmp/disc_clouder_rip*.mkv.merged.mkv",
+        "/tmp/disc_clouder_thumb.jpg",
+        "/tmp/disc_clouder_concat.txt",
+    ]:
+        for f in glob.glob(pattern):
+            try:
+                os.remove(f)
+                print(f"[CLEANUP] Removed {f}")
+            except OSError:
+                pass
+
+
 def main():
+    _startup_cleanup()
     app = QApplication(sys.argv)
     app.setFont(QFont("Helvetica", 13))
     window = DiscClouder()
