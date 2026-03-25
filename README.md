@@ -2,26 +2,34 @@
 
 A macOS desktop app for ripping DVDs and Blu-rays to MP4, with an embedded VLC preview player.
 
+Two separate apps, one per disc type:
+
+| App | Datei | Disc-Typ |
+|-----|-------|----------|
+| Blu-ray Ripper | `BLURAY-ONLY.py` | Blu-ray |
+| DVD Ripper | `DVD-ONLY.py` | DVD |
+
 ## Features
 
-- **DVD and Blu-ray support** — rip your personal disc collection
 - **Embedded VLC player** — preview titles before ripping
 - **Queue system** — add multiple titles, rip them sequentially
 - **Live thumbnails** — see what's being ripped in real time
 - **Hardware-accelerated encoding** — uses Apple VideoToolbox (h264_videotoolbox)
-- **Audio selection** — choose language per title
+- **Multi-Audio selection** — choose multiple audio tracks per title (with primary ❤️)
 - **Automatic disc detection** — scans when a new disc is inserted
+- **MPLS parsing** — reads audio metadata directly from Blu-ray playlists
+- **Retry/Resume** — rip resumes automatically on read errors
 
 ## Architecture
 
-| Component | DVD | Blu-ray |
+| Component | DVD (`DVD-ONLY.py`) | Blu-ray (`BLURAY-ONLY.py`) |
 |-----------|-----|---------|
-| Scan | lsdvd | VLC API + libbluray |
+| Scan | lsdvd | VLC API + MPLS + libbluray |
 | Preview | VLC (dvdsimple://) | VLC (bluray://) |
 | Rip Step 1 | VLC CLI → TS | ffmpeg → MKV |
 | Rip Step 2 | ffmpeg TS → MP4 | ffmpeg MKV → MP4 |
 | Video | H.264 (VideoToolbox) | copy (H.264) or VideoToolbox (VC-1) |
-| Audio | AAC Stereo | AAC Stereo |
+| Audio | AAC Stereo | AAC Stereo (alle gewählten Spuren) |
 
 ## Requirements
 
@@ -33,7 +41,7 @@ A macOS desktop app for ripping DVDs and Blu-rays to MP4, with an embedded VLC p
 ## Installation
 
 ```bash
-chmod +x install.sh
+chmod +x install-me.sh
 ./install.sh
 ```
 
@@ -44,22 +52,15 @@ The installer will:
 ## Usage
 
 ```bash
-python disc_clouder.py
+python BLURAY-ONLY.py
+python DVD-ONLY.py
 ```
-
-Or with debug mode (limits rips to 2 minutes for testing):
-
-```bash
-python disc_clouder.py --debug
-```
-
-The app auto-detects if it's not running in the `disc_clouder` conda environment and restarts itself in it.
 
 ## Workflow
 
 1. Insert a disc — the app scans automatically
 2. Click a title in the list to preview it
-3. Choose audio track from the dropdown
+3. Select audio tracks (✓ = included, ❤️ = primary language)
 4. Optionally add a suffix (e.g., "Extended", "S01E03")
 5. Click "+ Zur Queue"
 6. Repeat for more titles
