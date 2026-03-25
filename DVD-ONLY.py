@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""JoPhi's Disc Clouder — DVD/Blu-ray Ripper mit eingebettetem VLC."""
+"""JoPhi's Disc Clouder — DVD Ripper mit eingebettetem VLC."""
 
 import os
 import sys
@@ -13,7 +13,6 @@ if os.environ.get("CONDA_DEFAULT_ENV") != ENV_NAME:
 import json
 import sys
 import re
-import ctypes
 import subprocess
 import time
 import threading
@@ -33,8 +32,6 @@ from PyQt6.QtGui import QFont, QPixmap
 DEFAULT_OUTPUT = os.path.expanduser("~/Desktop/filme_sicherungen")
 TMP_RIP = "/tmp/disc_clouder_rip"  # extension added per disc type
 TMP_THUMB = "/tmp/disc_clouder_thumb.jpg"
-LIBBLURAY_PATH = "/opt/homebrew/lib/libbluray.dylib"
-
 DARK_STYLE = """
 QMainWindow, QWidget { background: #0d1b2a; color: #e0e0e0; }
 QLabel { color: #e0e0e0; }
@@ -90,52 +87,6 @@ LANG_MAP = {
 
 
 # ---------------------------------------------------------------------------
-# libbluray ctypes — get playlist numbers per title
-# ---------------------------------------------------------------------------
-class _BlurayTitleInfo(ctypes.Structure):
-    _fields_ = [
-        ("idx", ctypes.c_uint32),
-        ("playlist", ctypes.c_uint32),
-        ("duration", ctypes.c_uint64),
-        ("clip_count", ctypes.c_uint32),
-        ("angle_count", ctypes.c_uint8),
-        ("chapter_count", ctypes.c_uint32),
-    ]
-
-
-def get_playlist_map(mount_path):
-    """Return {title_idx: playlist_number} via libbluray.
-    Uses TITLES_RELEVANT (0x03) and min_length=60, same flags as VLC."""
-    try:
-        lib = ctypes.CDLL(LIBBLURAY_PATH)
-    except OSError:
-        return {}
-    lib.bd_open.restype = ctypes.c_void_p
-    lib.bd_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-    lib.bd_get_titles.restype = ctypes.c_uint32
-    lib.bd_get_titles.argtypes = [ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint32]
-    lib.bd_get_title_info.restype = ctypes.POINTER(_BlurayTitleInfo)
-    lib.bd_get_title_info.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
-    lib.bd_free_title_info.restype = None
-    lib.bd_free_title_info.argtypes = [ctypes.POINTER(_BlurayTitleInfo)]
-    lib.bd_close.restype = None
-    lib.bd_close.argtypes = [ctypes.c_void_p]
-
-    bd = lib.bd_open(mount_path.encode(), None)
-    if not bd:
-        return {}
-    mapping = {}
-    n = lib.bd_get_titles(bd, 0x03, 60)
-    for i in range(n):
-        info = lib.bd_get_title_info(bd, i, 0)
-        if info:
-            mapping[i] = info.contents.playlist
-            lib.bd_free_title_info(info)
-    lib.bd_close(bd)
-    return mapping
-
-
-# ---------------------------------------------------------------------------
 # Disc detection
 # ---------------------------------------------------------------------------
 def find_discs():
@@ -155,25 +106,20 @@ def find_discs():
             continue
         mount = re.search(r"Mount Point:\s+(.+)", info)
         name = re.search(r"Volume Name:\s+(.+)", info)
-        media = re.search(r"Optical Media Type:\s+(.+)", info)
         if not mount or not name:
             continue
         mount_point = mount.group(1).strip()
         vol_name = name.group(1).strip()
-        media_type = media.group(1).strip() if media else ""
-        disc_type = "bluray" if re.search(r"BD|Blu", media_type, re.I) else "dvd"
-        discs.append({"mount": mount_point, "name": vol_name, "type": disc_type})
+        discs.append({"mount": mount_point, "name": vol_name, "type": "dvd"})
     return discs
 
 
 # ---------------------------------------------------------------------------
-# VLC title scanning + libbluray playlist mapping
+# VLC title scanning
 # ---------------------------------------------------------------------------
 def scan_titles(disc, vlc_instance):
-    """Dispatch to DVD or Blu-ray scanner."""
-    if disc["type"] == "dvd":
-        return _scan_dvd(disc)
-    return _scan_bluray(disc, vlc_instance)
+    """Scan DVD titles."""
+    return _scan_dvd(disc)
 
 
 def _scan_dvd(disc):
@@ -234,109 +180,6 @@ def _scan_dvd(disc):
     return tracks
 
 
-def _scan_bluray(disc, vlc_instance):
-    """Scan Blu-ray titles via VLC + libbluray."""
-    mrl = f"bluray://{disc['mount']}"
-    player = vlc_instance.media_player_new()
-    media = vlc_instance.media_new(mrl)
-    media.add_option("no-bluray-menu")
-    player.set_media(media)
-    player.audio_set_volume(0)
-    player.play()
-
-    # Wait until VLC has loaded titles
-    title_descs = []
-    for _ in range(60):
-        time.sleep(0.5)
-        title_descs = list(player.get_full_title_descriptions() or [])
-        if title_descs:
-            break
-
-    # Set first long title so audio tracks load
-    for i, td in enumerate(title_descs):
-        if td.duration > 60000:
-            player.set_title(i)
-            break
-
-    # Wait until audio tracks are fully loaded
-    audio_descs = []
-    for _ in range(30):
-        time.sleep(0.5)
-        audio_descs = list(player.audio_get_track_description() or [])
-        if len(audio_descs) > 2:
-            break
-
-    # Parse audio tracks
-    audio_tracks = []
-    for item in audio_descs:
-        if isinstance(item, tuple):
-            aid, aname = item
-        else:
-            aid, aname = item.id, item.name
-        if aid < 0:
-            continue
-        if isinstance(aname, bytes):
-            aname = aname.decode("utf-8", errors="replace")
-        lang_code = ""
-        if isinstance(aname, str):
-            m = re.search(r"\[(\w+)\]", aname)
-            if m:
-                lang = m.group(1).lower()
-                lang_code = LANG_MAP.get(lang, lang[:3])
-        display_name = (
-            f"{aname} [{lang_code}]" if lang_code
-            else (aname or f"Track {aid}")
-        )
-        audio_tracks.append({"id": aid, "name": display_name, "lang": lang_code})
-
-    player.stop()
-    player.release()
-
-    # Get playlist numbers from libbluray
-    playlist_map = get_playlist_map(disc["mount"])
-
-    # Build track list
-    tracks = []
-    for i, td in enumerate(title_descs):
-        dur_sec = td.duration // 1000
-        if dur_sec < 30:
-            continue
-        playlist_num = playlist_map.get(i)
-        video_codec = _detect_video_codec(disc, playlist_num)
-        tracks.append({
-            "idx": i,
-            "duration": dur_sec,
-            "audio": audio_tracks,
-            "video_codec": video_codec,
-            "playlist": playlist_num,
-        })
-
-    tracks.sort(key=lambda t: -t["duration"])
-    return tracks
-
-
-def _detect_video_codec(disc, title_or_playlist):
-    """Detect video codec via ffprobe."""
-    mount = disc["mount"]
-    cmd = ["ffprobe", "-v", "quiet", "-show_entries", "stream=codec_name",
-           "-select_streams", "v:0", "-of", "csv=p=0"]
-    if disc["type"] == "dvd":
-        return "MPEG-2"  # DVDs are always MPEG-2
-    elif disc["type"] == "bluray" and title_or_playlist is not None:
-        cmd += ["-playlist", str(title_or_playlist)]
-        cmd += [f"bluray://{mount}"]
-    else:
-        cmd += [f"bluray://{mount}"]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        codec = result.stdout.strip().split("\n")[0].strip()
-        codec_names = {"h264": "H.264", "vc1": "VC-1", "mpeg2video": "MPEG-2",
-                       "hevc": "HEVC", "av1": "AV1"}
-        return codec_names.get(codec, codec.upper() if codec else "?")
-    except Exception:
-        return "?"
-
-
 # ---------------------------------------------------------------------------
 # Rip worker — processes a queue of jobs sequentially
 # ---------------------------------------------------------------------------
@@ -375,8 +218,7 @@ class RipWorker(QThread):
             name = job["name"]
             self.job_started.emit(i, total, name)
             mp4_path = os.path.join(self.output_dir, f"{name}.mp4")
-            ext = ".ts" if job.get("disc_type") == "dvd" else ".mkv"
-            self._tmp_rip = TMP_RIP + ext
+            self._tmp_rip = TMP_RIP + ".ts"
 
             # Step 1: Disc → temp file
             self.status.emit(f"Rippe: {name}")
@@ -434,14 +276,14 @@ class RipWorker(QThread):
         subprocess.run(["say", text], capture_output=True)
 
     def _cleanup(self):
-        for f in [getattr(self, '_tmp_rip', TMP_RIP + ".mkv"), TMP_THUMB]:
+        for f in [getattr(self, '_tmp_rip', TMP_RIP + ".ts"), TMP_THUMB]:
             try:
                 os.remove(f)
             except OSError:
                 pass
 
     def _extract_thumb(self, sec):
-        """Extract a frame from the growing MKV for thumbnail preview."""
+        """Extract a frame from the growing TS for thumbnail preview."""
         try:
             subprocess.run(
                 ["ffmpeg", "-y", "-ss", str(max(0, sec)), "-i", self._tmp_rip,
@@ -455,125 +297,70 @@ class RipWorker(QThread):
             pass
 
     def _rip(self, job):
-        """Blu-ray: Disc → MKV via ffmpeg. DVD: Disc → TS via VLC CLI."""
+        """DVD: Disc → TS via VLC CLI."""
         mount = self.disc["mount"]
         duration = job["duration"]
 
-        if job.get("video_codec") == "H.264":
-            v_args = ["-c:v", "copy"]
-        else:
-            v_args = ["-c:v", "h264_videotoolbox", "-q:v", "50"]
-
-        if self.disc["type"] == "dvd":
-            # DVD: VLC CLI reads disc, transcodes to H.264+AAC, writes MKV
-            link = "/tmp/disc_clouder_dvd"
-            try:
-                os.unlink(link)
-            except OSError:
-                pass
-            os.symlink(mount, link)
-            title_num = job.get("dvd_title", 1)
-            audio_idx = job.get("audio_idx", 0)
-            vlc_args = [
-                "/Applications/VLC.app/Contents/MacOS/VLC", "-I", "dummy",
-                f"dvdsimple://{link}#{title_num}",
-                f":no-sout-all", f":audio-track={audio_idx}",
-                f"--run-time={duration}",
-                f"--sout=#transcode{{vcodec=h264,acodec=mp4a,ab=192,channels=2}}"
-                f":standard{{access=file,mux=ts,dst={self._tmp_rip}}}",
-                "vlc://quit",
-            ]
-            print(f"[RIP-DVD] cmd: {' '.join(vlc_args)}")
-            proc = subprocess.Popen(
-                vlc_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-            )
-            # Monitor progress via ffprobe duration of growing MKV
-            start = time.time()
-            last_pct = -1
-            while proc.poll() is None:
-                if self._cancel:
-                    proc.kill()
-                    proc.wait()
-                    return
-                try:
-                    probe = subprocess.run(
-                        ["ffprobe", "-v", "quiet", "-show_entries",
-                         "format=duration", "-of", "csv=p=0", self._tmp_rip],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    current_sec = int(float(probe.stdout.strip()))
-                except Exception:
-                    current_sec = 0
-                if current_sec > 0 and duration > 0:
-                    self.progress_rip.emit(current_sec, duration)
-                    pct = (current_sec * 100) // duration
-                    if pct != last_pct and current_sec > 5:
-                        last_pct = pct
-                        self._extract_thumb(current_sec - 2)
-                    # Kill VLC if we've reached the expected duration
-                    if current_sec >= duration - 5:
-                        proc.kill()
-                        proc.wait()
-                        break
-                time.sleep(2)
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            self.progress_rip.emit(duration, duration)
-            return
-        else:
-            cmd = [
-                "ffmpeg", "-y",
-                "-err_detect", "ignore_err", "-max_error_rate", "1.0",
-            ]
-            if job.get("playlist") is not None:
-                cmd += ["-playlist", str(job["playlist"])]
-            cmd += ["-i", f"bluray://{mount}"]
-            if DEBUG:
-                cmd += ["-t", "120"]
-            cmd += [
-                "-map", "0:v:0", "-map", f"0:a:{job['audio_idx']}",
-                *v_args,
-                "-c:a", "aac", "-ac", "2", "-b:a", "192k",
-                "-progress", "pipe:1",
-                self._tmp_rip,
-            ]
-
-        print(f"[RIP] cmd: {' '.join(cmd)}")
-
+        # DVD: VLC CLI reads disc, transcodes to H.264+AAC, writes TS
+        link = "/tmp/disc_clouder_dvd"
+        try:
+            os.unlink(link)
+        except OSError:
+            pass
+        os.symlink(mount, link)
+        title_num = job.get("dvd_title", 1)
+        audio_idx = job.get("audio_idx", 0)
+        vlc_args = [
+            "/Applications/VLC.app/Contents/MacOS/VLC", "-I", "dummy",
+            f"dvdsimple://{link}#{title_num}",
+            f":no-sout-all", f":audio-track={audio_idx}",
+            f"--run-time={duration}",
+            f"--sout=#transcode{{vcodec=h264,acodec=mp4a,ab=192,channels=2}}"
+            f":standard{{access=file,mux=ts,dst={self._tmp_rip}}}",
+            "vlc://quit",
+        ]
+        print(f"[RIP-DVD] cmd: {' '.join(vlc_args)}")
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL, text=True,
+            vlc_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
         )
-
-        last_sec = 0
+        # Monitor progress via ffprobe duration of growing TS
+        start = time.time()
         last_pct = -1
-        for line in proc.stdout:
+        while proc.poll() is None:
             if self._cancel:
                 proc.kill()
                 proc.wait()
                 return
-            line = line.strip()
-            if line.startswith("out_time_ms="):
-                try:
-                    current_sec = int(line.split("=")[1]) // 1_000_000
-                    if current_sec > last_sec:
-                        last_sec = current_sec
-                        self.progress_rip.emit(current_sec, duration)
-                        pct = (current_sec * 100) // duration if duration > 0 else 0
-                        if pct != last_pct and current_sec > 5:
-                            last_pct = pct
-                            self._extract_thumb(current_sec - 2)
-                except ValueError:
-                    pass
-
-        proc.wait()
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-show_entries",
+                     "format=duration", "-of", "csv=p=0", self._tmp_rip],
+                    capture_output=True, text=True, timeout=5,
+                )
+                current_sec = int(float(probe.stdout.strip()))
+            except Exception:
+                current_sec = 0
+            if current_sec > 0 and duration > 0:
+                self.progress_rip.emit(current_sec, duration)
+                pct = (current_sec * 100) // duration
+                if pct != last_pct and current_sec > 5:
+                    last_pct = pct
+                    self._extract_thumb(current_sec - 2)
+                # Kill VLC if we've reached the expected duration
+                if current_sec >= duration - 5:
+                    proc.kill()
+                    proc.wait()
+                    break
+            time.sleep(2)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
         self.progress_rip.emit(duration, duration)
 
     def _convert(self, src_path, dst_path, job=None):
-        """Convert MKV → MP4. Both DVD and Blu-ray MKVs already contain
-        H.264 + AAC, so this is just a container remux + aspect ratio for DVD."""
+        """Convert TS → MP4. DVD TS files already contain
+        H.264 + AAC, so this is just a container remux + aspect ratio."""
         duration = 0
         try:
             probe = subprocess.run(
@@ -631,7 +418,7 @@ class DiscClouder(QMainWindow):
         self.setMinimumSize(1000, 750)
         self.setStyleSheet(DARK_STYLE)
 
-        self.vlc_instance = vlc.Instance("--no-xlib", "--no-bluray-menu", "--quiet")
+        self.vlc_instance = vlc.Instance("--no-xlib", "--quiet")
         self.vlc_player = self.vlc_instance.media_player_new()
 
         self.disc = None
@@ -825,7 +612,7 @@ class DiscClouder(QMainWindow):
 
         vr.addSpacing(10)
 
-        self.lbl_bar1 = QLabel("Disc → MKV")
+        self.lbl_bar1 = QLabel("Disc → TS")
         self.lbl_bar1.setStyleSheet("color: #4ecdc4; font-weight: bold;")
         vr.addWidget(self.lbl_bar1)
         self.bar_rip = QProgressBar()
@@ -838,7 +625,7 @@ class DiscClouder(QMainWindow):
 
         vr.addSpacing(12)
 
-        self.lbl_bar2 = QLabel("MKV → MP4")
+        self.lbl_bar2 = QLabel("TS → MP4")
         self.lbl_bar2.setStyleSheet("color: #4ecdc4; font-weight: bold;")
         vr.addWidget(self.lbl_bar2)
         self.bar_convert = QProgressBar()
@@ -871,7 +658,7 @@ class DiscClouder(QMainWindow):
     # Signals
     # =====================================================================
     def _connect_signals(self):
-        self.btn_scan.clicked.connect(self._scan_discs)
+        self.btn_scan.clicked.connect(lambda: self._full_reset(eject=False))
         self.btn_eject.clicked.connect(self._eject)
         self.btn_play.clicked.connect(self._toggle_play)
         self.btn_stop_player.clicked.connect(self._stop_player)
@@ -954,12 +741,6 @@ class DiscClouder(QMainWindow):
         for i in range(4):
             self.track_tree.resizeColumnToContents(i)
 
-        # Set up preview player (Blu-ray only — DVD sets media per title click)
-        if self.disc["type"] == "bluray":
-            mrl = f"bluray://{self.disc['mount']}"
-            media = self.vlc_instance.media_new(mrl)
-            media.add_option("no-bluray-menu")
-            self.vlc_player.set_media(media)
         self.vlc_player.set_nsobject(int(self.video_widget.winId()))
         self.vlc_player.audio_set_volume(self.vol_slider.value())
 
@@ -974,23 +755,17 @@ class DiscClouder(QMainWindow):
         if not track:
             return
 
-        if self.disc["type"] == "dvd":
-            # DVD: open new media with title in URL
-            link = "/tmp/disc_clouder_dvd"
-            try:
-                os.unlink(link)
-            except OSError:
-                pass
-            os.symlink(self.disc["mount"], link)
-            media = self.vlc_instance.media_new(f"dvdsimple://{link}#{idx}")
-            self.vlc_player.set_media(media)
-            self.vlc_player.set_nsobject(int(self.video_widget.winId()))
-            self.vlc_player.play()
-        else:
-            # Blu-ray: set_title on existing media
-            self.vlc_player.play()
-            time.sleep(0.3)
-            self.vlc_player.set_title(idx)
+        # DVD: open new media with title in URL
+        link = "/tmp/disc_clouder_dvd"
+        try:
+            os.unlink(link)
+        except OSError:
+            pass
+        os.symlink(self.disc["mount"], link)
+        media = self.vlc_instance.media_new(f"dvdsimple://{link}#{idx}")
+        self.vlc_player.set_media(media)
+        self.vlc_player.set_nsobject(int(self.video_widget.winId()))
+        self.vlc_player.play()
 
         time.sleep(0.3)
         self.vlc_player.audio_set_volume(self.vol_slider.value())
@@ -1173,10 +948,8 @@ class DiscClouder(QMainWindow):
         self._rip_start_time = time.time()
         self._rip_history = []
         self._convert_start_time = None
-        # Set bar labels based on disc type
-        is_dvd = self.disc and self.disc["type"] == "dvd"
-        self.lbl_bar1.setText("Disc → TS" if is_dvd else "Disc → MKV")
-        self.lbl_bar2.setText("TS → MP4" if is_dvd else "MKV → MP4")
+        self.lbl_bar1.setText("Disc → TS")
+        self.lbl_bar2.setText("TS → MP4")
 
     def _on_rip_progress(self, current, total):
         self.bar_rip.setMaximum(total)
@@ -1246,9 +1019,7 @@ class DiscClouder(QMainWindow):
             item.setText(0, f"✓ {item.text(0)}")
 
     def _on_all_finished(self):
-        self._restore_after_rip()
-        self.queue.clear()
-        self.queue_tree.clear()
+        self._full_reset()
         self.lbl_status.setText("Alle Rips fertig!")
 
     def _on_rip_error(self, idx, msg):
@@ -1262,33 +1033,88 @@ class DiscClouder(QMainWindow):
             self.rip_worker.cancel()
 
     def _on_cancelled(self):
-        self._restore_after_rip()
-        self.queue.clear()
-        self.queue_tree.clear()
+        self._full_reset()
         self.lbl_status.setText("Abgebrochen")
 
-    def _restore_after_rip(self):
+    def _full_reset(self, eject=True):
+        """Complete reset — as if the app was freshly started."""
+
+        # 1. Stop timers
+        self.pos_timer.stop()
+        self.disc_poll_timer.stop()
+
+        # 2. Kill VLC completely and recreate
+        try:
+            self.vlc_player.stop()
+        except Exception:
+            pass
+        try:
+            self.vlc_player.release()
+        except Exception:
+            pass
+        try:
+            self.vlc_instance.release()
+        except Exception:
+            pass
+        self.vlc_instance = vlc.Instance("--no-xlib", "--quiet")
+        self.vlc_player = self.vlc_instance.media_player_new()
+
+        # 3. Eject disc (optional)
+        if eject:
+            subprocess.run(["drutil", "eject"], capture_output=True)
+
+        # 4. Delete ALL temp files
+        for f in [TMP_RIP + ".ts", TMP_THUMB,
+                  "/tmp/disc_clouder_dvd"]:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+        # 5. Reset ALL data variables
+        self.disc = None
+        self.tracks = []
+        self.queue = []
+        self.rip_worker = None
+        self._seeking = False
+        self._title_set_by_user = False
+        self._rip_start_time = 0
+        self._convert_start_time = None
+        self._rip_history = []
+
+        # 6. Reset ALL UI to startup state
         self.stack.setCurrentIndex(0)
-        self.lbl_thumb.clear()
         self.btn_scan.setVisible(True)
         self.btn_eject.setVisible(True)
-        self._scan_discs()
+        self.lbl_disc.setText("Keine Disc")
+        self.lbl_type.setText("")
+        self.lbl_status.setText("")
+        self.lbl_time.setText("00:00 / 00:00")
+        self.btn_play.setText("Play")
+        self.track_tree.clear()
+        self.queue_tree.clear()
+        self.combo_audio.clear()
+        self.edit_suffix.clear()
+        self.edit_base_title.clear()
+        self.lbl_thumb.clear()
+        self.seek_slider.setValue(0)
+        self.vol_slider.setValue(80)
+        self.bar_rip.setValue(0)
+        self.bar_convert.setValue(0)
+        self.lbl_rip_stats.setText("")
+        self.lbl_convert_stats.setText("")
+        self.lbl_rip_title.setText("")
+
+        # 7. Restart disc polling and scan — like __init__ does
+        self._last_volumes = set()
+        self.disc_poll_timer.start()
+        QTimer.singleShot(500, self._scan_discs)
 
     # =====================================================================
     # Eject
     # =====================================================================
     def _eject(self):
-        self.vlc_player.stop()
-        subprocess.run(["drutil", "eject"], capture_output=True)
-        self.disc = None
-        self.tracks = []
-        self.track_tree.clear()
-        self.queue.clear()
-        self.queue_tree.clear()
-        self._title_set_by_user = False
-        self.edit_base_title.clear()
-        self.lbl_disc.setText("Keine Disc — bitte einlegen")
-        self.lbl_type.setText("")
+        self._full_reset()
         self.lbl_status.setText("Disc ausgeworfen")
 
     # =====================================================================
