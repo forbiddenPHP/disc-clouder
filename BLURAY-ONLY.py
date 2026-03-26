@@ -8,7 +8,7 @@ import vlc
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QSlider, QProgressBar,
+    QLabel, QPushButton, QLineEdit, QSlider, QProgressBar, QSpinBox, QCheckBox,
     QTreeWidget, QTreeWidgetItem, QStackedWidget, QTabWidget, QMessageBox,
 )
 from PyQt6.QtGui import QFont, QPixmap, QIcon
@@ -369,11 +369,13 @@ class RipWorker(QThread):
     cancelled = pyqtSignal()
     error = pyqtSignal(int, str)
 
-    def __init__(self, queue, mount, output_dir):
+    def __init__(self, queue, mount, output_dir, readrate=2, trouble_mode=False):
         super().__init__()
         self.queue = queue
         self.mount = mount
         self.output_dir = output_dir
+        self.readrate = readrate
+        self.trouble_mode = trouble_mode
         self._cancel = False
 
     def cancel(self):
@@ -445,24 +447,39 @@ class RipWorker(QThread):
         video_codec = job.get("video_codec", "?")
         all_audio = job.get("all_audio", [])
 
+        # Manual trouble mode
+        if self.trouble_mode:
+            print("[RIP] Manual TROUBLE MODE activated")
+            self.status.emit("TROUBLE MODE — Kopiere Disc...")
+            self._trouble_mode(job)
+            return
+
         v_codec = ["-c:v", "copy"] if video_codec.lower() in ("h264", "h.264") \
             else ["-c:v", "h264_videotoolbox", "-q:v", "50"]
 
-        # BD-50 detection
+        # BD-50 detection (single diskutil call)
         is_bd50 = False
+        is_virtual = False
         try:
             r = subprocess.run(["diskutil", "info", self.mount],
                                capture_output=True, text=True, timeout=5)
             m = re.search(r"Disk Size:\s+(\d[\d.]*)\s+GB", r.stdout)
             if m and float(m.group(1)) > 30:
                 is_bd50 = True
-                print("[RIP] Dual-layer (BD-50) — readrate 10x")
+            is_virtual = "Virtual:                   Yes" in r.stdout
         except Exception:
             pass
 
         cmd = ["ffmpeg", "-y", "-err_detect", "ignore_err", "-max_error_rate", "1.0"]
-        if is_bd50:
-            cmd += ["-readrate", "10"]
+        if is_bd50 and not is_virtual:
+            rate = self.readrate
+            if rate > 0:
+                cmd += ["-readrate", str(rate)]
+                print(f"[RIP] Dual-layer (BD-50) — readrate {rate}x")
+            else:
+                print("[RIP] Dual-layer (BD-50) — Max speed")
+        elif is_bd50:
+            print("[RIP] Dual-layer (BD-50) on disk image — no readrate limit")
         if playlist is not None:
             cmd += ["-playlist", str(playlist)]
         cmd += ["-i", f"bluray://{self.mount}", "-map", "0:v:0"]
@@ -479,6 +496,7 @@ class RipWorker(QThread):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log,
                                 stdin=subprocess.DEVNULL, text=True)
         last_sec, last_pct = 0, -1
+        last_size, stall_since = 0, time.time()
         for line in proc.stdout:
             if self._cancel:
                 proc.kill(); proc.wait(); log.close()
@@ -496,6 +514,19 @@ class RipWorker(QThread):
                             self._thumb(sec - 2)
                 except ValueError:
                     pass
+            # Filesize watchdog
+            try:
+                sz = os.path.getsize(TMP_MKV)
+                if sz != last_size:
+                    last_size, stall_since = sz, time.time()
+                elif time.time() - stall_since > 10:
+                    print(f"[WATCHDOG] Stall detected — switching to TROUBLE MODE")
+                    proc.kill(); proc.wait(); log.close()
+                    self.status.emit("TROUBLE MODE — Kopiere Disc...")
+                    self._trouble_mode(job)
+                    return
+            except OSError:
+                pass
         proc.wait()
         log.close()
         # Log ffmpeg errors
@@ -517,6 +548,75 @@ class RipWorker(QThread):
         except Exception:
             pass
 
+    def _trouble_mode(self, job):
+        """dd disc to ISO, mount, re-rip from image."""
+        print("[TROUBLE] Starting dd...")
+        iso_path = os.path.join(APP_TMP, "disc_image.iso")
+        # Find device
+        r = subprocess.run(["diskutil", "info", self.mount], capture_output=True, text=True, timeout=5)
+        dev_match = re.search(r"Device Node:\s+(/dev/disk\d+)", r.stdout)
+        if not dev_match:
+            print("[TROUBLE] Cannot find device node")
+            return
+        dev = dev_match.group(1)
+        # Unmount (keep device)
+        subprocess.run(["diskutil", "unmountDisk", dev], capture_output=True)
+        # Get disc size for progress
+        size_match = re.search(r"Disk Size:\s+(\d[\d.]*)\s+GB", r.stdout)
+        total_bytes = int(float(size_match.group(1)) * 1e9) if size_match else 0
+        # dd with progress
+        print(f"[TROUBLE] dd {dev} → {iso_path} ({total_bytes // 1_000_000_000} GB)")
+        proc = subprocess.Popen(
+            ["osascript", "-e",
+             f'do shell script "dd if={dev} of=\\"{iso_path}\\" bs=1m" with administrator privileges'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Monitor dd progress via file size
+        while proc.poll() is None:
+            time.sleep(2)
+            if self._cancel:
+                proc.kill(); proc.wait()
+                print("[TROUBLE] Cancelled")
+                return
+            try:
+                sz = os.path.getsize(iso_path)
+                if total_bytes > 0:
+                    pct = int(sz * 100 / total_bytes)
+                    self.status.emit(f"TROUBLE MODE — Kopiere Disc... {pct}%")
+                    print(f"[TROUBLE] dd progress: {pct}% ({sz // 1_000_000} MB)")
+            except OSError:
+                pass
+        proc.wait()
+        print(f"[TROUBLE] dd done: {os.path.getsize(iso_path)} bytes")
+        # Eject original disc
+        subprocess.run(["drutil", "eject"], capture_output=True)
+        print("[TROUBLE] Original disc ejected")
+        # Mount ISO
+        r = subprocess.run(["hdiutil", "attach", iso_path], capture_output=True, text=True)
+        mount_match = re.search(r"(/Volumes/.+)$", r.stdout.strip(), re.MULTILINE)
+        if not mount_match:
+            print("[TROUBLE] Cannot mount ISO")
+            return
+        new_mount = mount_match.group(1).strip()
+        print(f"[TROUBLE] ISO mounted at {new_mount}")
+        # Update mount and re-rip
+        old_mount = self.mount
+        self.mount = new_mount
+        self.status.emit("TROUBLE MODE — Rippe von Image...")
+        # Clean failed temp file
+        try:
+            os.remove(TMP_MKV)
+        except OSError:
+            pass
+        self._rip(job)
+        # Cleanup
+        subprocess.run(["hdiutil", "detach", new_mount], capture_output=True)
+        try:
+            os.remove(iso_path)
+        except OSError:
+            pass
+        print("[TROUBLE] ISO unmounted and deleted")
+        self.mount = old_mount
+
     def _convert(self, src, dst):
         dur = 0
         try:
@@ -525,7 +625,7 @@ class RipWorker(QThread):
             dur = int(float(r.stdout.strip()))
         except Exception:
             pass
-        cmd = ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart",
+        cmd = ["ffmpeg", "-y", "-i", src, "-map", "0", "-c", "copy", "-movflags", "+faststart",
                "-progress", "pipe:1", dst]
         print(f"[CONVERT] cmd: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -716,6 +816,20 @@ class DiscClouder(QMainWindow):
         self.queue_tree.setEditTriggers(QTreeWidget.EditTrigger.DoubleClicked)
         self.queue_tree.itemChanged.connect(self._on_queue_changed)
         t2l.addWidget(self.queue_tree)
+
+        bd50_row = QHBoxLayout()
+        bd50_row.addWidget(QLabel("BD-50 Speed:"))
+        self.spin_readrate = QSpinBox()
+        self.spin_readrate.setRange(0, 10)
+        self.spin_readrate.setValue(2)
+        self.spin_readrate.setSpecialValueText("Max")
+        self.spin_readrate.setFixedWidth(70)
+        bd50_row.addWidget(self.spin_readrate)
+        self.chk_trouble = QCheckBox("Trouble Mode")
+        self.chk_trouble.setChecked(True)
+        bd50_row.addWidget(self.chk_trouble)
+        bd50_row.addStretch()
+        t2l.addLayout(bd50_row)
 
         qrow = QHBoxLayout()
         qrow.addWidget(QLabel("Zielordner:"))
@@ -1136,7 +1250,9 @@ class DiscClouder(QMainWindow):
         self._conv_start = None
 
         self.rip_worker = RipWorker(list(self.queue), self.disc["mount"],
-                                    self.edit_output.text().strip() or DEFAULT_OUTPUT)
+                                    self.edit_output.text().strip() or DEFAULT_OUTPUT,
+                                    readrate=self.spin_readrate.value(),
+                                    trouble_mode=self.chk_trouble.isChecked())
         self.rip_worker.progress_rip.connect(self._on_rip_progress)
         self.rip_worker.progress_convert.connect(self._on_conv_progress)
         self.rip_worker.thumbnail.connect(self._on_thumb)
@@ -1271,6 +1387,24 @@ def main():
     print("[APP] Starting JoPhi's Disc Clouder v2")
     app = QApplication(sys.argv)
     app.setFont(QFont("Helvetica", 13))
+    icon_path = os.path.join(APP_DIR, "assets", "bluray-only.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+        # macOS Dock icon
+        try:
+            from Foundation import NSBundle
+            bundle = NSBundle.mainBundle()
+            info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
+            info["CFBundleName"] = "Disc Clouder"
+        except ImportError:
+            pass
+        try:
+            from AppKit import NSApplication, NSImage
+            ns_app = NSApplication.sharedApplication()
+            ns_icon = NSImage.alloc().initByReferencingFile_(icon_path)
+            ns_app.setApplicationIconImage_(ns_icon)
+        except ImportError:
+            pass
     w = DiscClouder()
     w.show()
     sys.exit(app.exec())
