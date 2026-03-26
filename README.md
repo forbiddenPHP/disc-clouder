@@ -1,91 +1,51 @@
 # JoPhi's Disc Clouder
 
-A macOS desktop app for ripping DVDs and Blu-rays to MP4, with an embedded VLC preview player.
+> A private vibe-coding project — built to learn macOS multimedia, Blu-ray internals, and PyQt6. Made interactively with AI.
 
-Two separate apps, one per disc type:
+Rips DVDs and Blu-rays to MP4 on macOS (Apple Silicon).
 
-| App | Datei | Disc-Typ |
-|-----|-------|----------|
-| Blu-ray Ripper | `BLURAY-ONLY.py` | Blu-ray |
-| DVD Ripper | `DVD-ONLY.py` | DVD |
+| App | File |
+|-----|------|
+| Blu-ray | `BLURAY-ONLY.py` |
+| DVD | `DVD-ONLY.py` |
 
-## Features
-
-- **Embedded VLC player** — preview titles before ripping
-- **Queue system** — add multiple titles, rip them sequentially
-- **Live thumbnails** — see what's being ripped in real time
-- **Hardware-accelerated encoding** — uses Apple VideoToolbox (h264_videotoolbox)
-- **Multi-Audio selection** — choose multiple audio tracks per title (with primary ❤️)
-- **Automatic disc detection** — scans when a new disc is inserted
-- **MPLS parsing** — reads audio metadata directly from Blu-ray playlists
-- **Retry/Resume** — rip resumes automatically on read errors
-
-## Architecture
-
-| Component | DVD (`DVD-ONLY.py`) | Blu-ray (`BLURAY-ONLY.py`) |
-|-----------|-----|---------|
-| Scan | lsdvd | VLC API + MPLS + libbluray |
-| Preview | VLC (dvdsimple://) | VLC (bluray://) |
-| Rip Step 1 | VLC CLI → TS | ffmpeg → MKV |
-| Rip Step 2 | ffmpeg TS → MP4 | ffmpeg MKV → MP4 |
-| Video | H.264 (VideoToolbox) | copy (H.264) or VideoToolbox (VC-1) |
-| Audio | AAC Stereo | AAC Stereo (alle gewählten Spuren) |
-
-## Requirements
-
-- macOS (Apple Silicon or Intel)
-- Miniconda or Anaconda
-- Homebrew
-- An optical disc drive
-
-## Installation
+## Setup
 
 ```bash
-chmod +x install-me.sh
-./install.sh
+chmod +x install-me.sh && ./install-me.sh
 ```
 
-The installer will:
-1. Create a conda environment `disc_clouder` with Python 3.12.3
-2. Install brew packages: ffmpeg, VLC, lsdvd, p7zip
-
-## Usage
+## Run
 
 ```bash
 python BLURAY-ONLY.py
 python DVD-ONLY.py
 ```
 
-## Workflow
+## What it does
 
-1. Insert a disc — the app scans automatically
-2. Click a title in the list to preview it
-3. Select audio tracks (✓ = included, ❤️ = primary language)
-4. Optionally add a suffix (e.g., "Extended", "S01E03")
-5. Click "+ Zur Queue"
-6. Repeat for more titles
-7. Switch to the "Queue" tab
-8. Click "Queue starten"
-9. Wait — live thumbnails and progress bars show what's happening
-10. The app announces completion via macOS `say`
-
-## File Locations
-
-| What | Where |
-|------|-------|
-| Temp rip files | `/tmp/disc_clouder_rip.*` |
-| Output | `~/Desktop/filme_sicherungen/` (configurable) |
+- VLC preview player — watch before you rip
+- Multi-audio selection (❤️ = primary)
+- Queue — rip multiple titles in sequence
+- Live thumbnails during rip
+- Hardware encoding (Apple VideoToolbox)
+- Trouble Mode — copies BD-50 to SSD first, then rips (for cheap drives)
+- Configurable BD-50 read speed (default: 2x)
+- Announces completion via `say`
 
 ## Disclaimer
 
-This software is designed to rip unprotected DVDs and Blu-rays. No decryption libraries, keys, or DRM-bypassing tools are included or distributed.
+This is for **unprotected** discs only. The following are **not** included:
 
-It is the user's sole responsibility to ensure compliance with applicable copyright laws in their jurisdiction.
+- KEYDB.cfg, libaacs, libbdplus, BD+ VM/Convtab — Blu-ray decryption
+- libdvdcss — DVD decryption
+
+Your jurisdiction, your responsibility.
+
+## Advanced
+
+`install.zip` (password: `secret`) contains `install.sh` — use it instead of `install-me.sh` if you have legally obtained decryption libraries. By entering the password, you confirm to all rights holders that you have the legal right to do so.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE)
-
-## Author
-
-Johannes Hinterberger
+MIT — see [LICENSE](LICENSE)

@@ -369,13 +369,14 @@ class RipWorker(QThread):
     cancelled = pyqtSignal()
     error = pyqtSignal(int, str)
 
-    def __init__(self, queue, mount, output_dir, readrate=2, trouble_mode=False):
+    def __init__(self, queue, mount, output_dir, readrate=2, trouble_mode=False, sudo_pw=None):
         super().__init__()
         self.queue = queue
         self.mount = mount
         self.output_dir = output_dir
         self.readrate = readrate
         self.trouble_mode = trouble_mode
+        self.sudo_pw = sudo_pw
         self._cancel = False
 
     def cancel(self):
@@ -567,17 +568,18 @@ class RipWorker(QThread):
         # Get disc size for progress
         size_match = re.search(r"Disk Size:\s+(\d[\d.]*)\s+GB", r.stdout)
         total_bytes = int(float(size_match.group(1)) * 1e9) if size_match else 0
-        # dd with progress
+        # dd with sudo (password from main thread dialog)
         print(f"[TROUBLE] dd {dev} → {iso_path} ({total_bytes // 1_000_000_000} GB)")
-        proc = subprocess.Popen(
-            ["osascript", "-e",
-             f'do shell script "dd if={dev} of=\\"{iso_path}\\" bs=1m" with administrator privileges'],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        dd_proc = subprocess.Popen(
+            ["sudo", "-S", "dd", f"if={dev}", f"of={iso_path}", "bs=1m"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        dd_proc.stdin.write(f"{self.sudo_pw}\n".encode())
+        dd_proc.stdin.flush()
         # Monitor dd progress via file size
-        while proc.poll() is None:
+        while dd_proc.poll() is None:
             time.sleep(2)
             if self._cancel:
-                proc.kill(); proc.wait()
+                dd_proc.kill(); dd_proc.wait()
                 print("[TROUBLE] Cancelled")
                 return
             try:
@@ -588,7 +590,7 @@ class RipWorker(QThread):
                     print(f"[TROUBLE] dd progress: {pct}% ({sz // 1_000_000} MB)")
             except OSError:
                 pass
-        proc.wait()
+        dd_proc.wait()
         print(f"[TROUBLE] dd done: {os.path.getsize(iso_path)} bytes")
         # Eject original disc
         subprocess.run(["drutil", "eject"], capture_output=True)
@@ -605,6 +607,7 @@ class RipWorker(QThread):
         old_mount = self.mount
         self.mount = new_mount
         self.status.emit("TROUBLE MODE — Rippe von Image...")
+        self.trouble_mode = False  # Prevent recursion
         # Clean failed temp file
         try:
             os.remove(TMP_MKV)
@@ -1252,10 +1255,25 @@ class DiscClouder(QMainWindow):
         self._rip_history = []
         self._conv_start = None
 
+        sudo_pw = None
+        if self.chk_trouble.isChecked():
+            from PyQt6.QtWidgets import QInputDialog
+            pw, ok = QInputDialog.getText(self, "Disc Clouder",
+                "Trouble Mode requires 'sudo' to copy the disc.\nPlease enter your administrator password:",
+                QLineEdit.EchoMode.Password)
+            if not ok or not pw:
+                self.lbl_status.setText("Abgebrochen")
+                self.stack.setCurrentIndex(0)
+                self.btn_scan.setVisible(True)
+                self.btn_eject.setVisible(True)
+                return
+            sudo_pw = pw
+
         self.rip_worker = RipWorker(list(self.queue), self.disc["mount"],
                                     self.edit_output.text().strip() or DEFAULT_OUTPUT,
                                     readrate=self.spin_readrate.value(),
-                                    trouble_mode=self.chk_trouble.isChecked())
+                                    trouble_mode=self.chk_trouble.isChecked(),
+                                    sudo_pw=sudo_pw)
         self.rip_worker.progress_rip.connect(self._on_rip_progress)
         self.rip_worker.progress_convert.connect(self._on_conv_progress)
         self.rip_worker.thumbnail.connect(self._on_thumb)
