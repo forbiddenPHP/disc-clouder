@@ -792,6 +792,10 @@ class DiscClouder(QMainWindow):
         self.setWindowTitle("JoPhi's Disc Clouder")
         self.setMinimumSize(1000, 750)
         self.setStyleSheet(DARK_STYLE)
+        icon_path = os.path.join(os.path.dirname(__file__), "assets", "bluray-only.png")
+        if os.path.exists(icon_path):
+            from PyQt6.QtGui import QIcon
+            self.setWindowIcon(QIcon(icon_path))
 
         self.vlc_instance = vlc.Instance("--no-xlib", "--no-bluray-menu", "--quiet", "--no-spu")
         self.vlc_player = self.vlc_instance.media_player_new()
