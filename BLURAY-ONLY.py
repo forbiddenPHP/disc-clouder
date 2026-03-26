@@ -551,6 +551,9 @@ class RipWorker(QThread):
     def _trouble_mode(self, job):
         """dd disc to ISO, mount, re-rip from image."""
         print("[TROUBLE] Starting dd...")
+        icon_path = os.path.join(APP_DIR, "assets", "bluray-only.png")
+        if os.path.exists(icon_path):
+            self.thumbnail.emit(icon_path)
         iso_path = os.path.join(APP_TMP, "disc_image.iso")
         # Find device
         r = subprocess.run(["diskutil", "info", self.mount], capture_output=True, text=True, timeout=5)
