@@ -1184,6 +1184,10 @@ class DiscClouder(QMainWindow):
 
         primary_idx = None
         all_audio = []
+        # Get VLC track IDs for correct ffmpeg stream mapping
+        valid = [(x[0] if isinstance(x, tuple) else x.id)
+                 for x in (self.vlc_player.audio_get_track_description() or [])
+                 if (x[0] if isinstance(x, tuple) else x.id) >= 0]
         for i in range(self.audio_list.topLevelItemCount()):
             ai = self.audio_list.topLevelItem(i)
             if ai.checkState(0) != Qt.CheckState.Checked:
@@ -1192,12 +1196,13 @@ class DiscClouder(QMainWindow):
             lang = ad.get("lang", "und") if ad else "und"
             label = ai.text(5).strip() or (ad.get("lang_name", "?") if ad else "?")
             is_pri = ai.text(1) == "❤️"
-            print(f"[QUEUE] Audio idx={i}, lang={lang}, label='{label}', primary={is_pri}")
+            ffmpeg_idx = valid[i] - 0x1100 if i < len(valid) else i
+            print(f"[QUEUE] Audio row={i}, ffmpeg_idx={ffmpeg_idx}, lang={lang}, label='{label}', primary={is_pri}")
             if is_pri:
                 primary_idx = i
-                all_audio.insert(0, {"idx": i, "lang": lang, "label": label})
+                all_audio.insert(0, {"idx": ffmpeg_idx, "lang": lang, "label": label})
             else:
-                all_audio.append({"idx": i, "lang": lang, "label": label})
+                all_audio.append({"idx": ffmpeg_idx, "lang": lang, "label": label})
 
         if primary_idx is None:
             self.lbl_status.setText("Keine Audio-Spur ausgewählt (❤️)")
@@ -1258,15 +1263,22 @@ class DiscClouder(QMainWindow):
         sudo_pw = None
         if self.chk_trouble.isChecked():
             from PyQt6.QtWidgets import QInputDialog
-            pw, ok = QInputDialog.getText(self, "Disc Clouder",
-                "Trouble Mode requires 'sudo' to copy the disc.\nPlease enter your administrator password:",
-                QLineEdit.EchoMode.Password)
-            if not ok or not pw:
-                self.lbl_status.setText("Abgebrochen")
-                self.stack.setCurrentIndex(0)
-                self.btn_scan.setVisible(True)
-                self.btn_eject.setVisible(True)
-                return
+            while True:
+                pw, ok = QInputDialog.getText(self, "Disc Clouder",
+                    "Trouble Mode requires 'sudo' to copy the disc.\nPlease enter your administrator password:",
+                    QLineEdit.EchoMode.Password)
+                if not ok:
+                    self.lbl_status.setText("Abgebrochen")
+                    self.stack.setCurrentIndex(0)
+                    self.btn_scan.setVisible(True)
+                    self.btn_eject.setVisible(True)
+                    return
+                # Verify password
+                r = subprocess.run(["sudo", "-S", "echo", "ok"],
+                    input=f"{pw}\n", capture_output=True, text=True, timeout=5)
+                if r.stdout.strip() == "ok":
+                    break
+                QMessageBox.warning(self, "Disc Clouder", "Wrong password. Please try again.")
             sudo_pw = pw
 
         self.rip_worker = RipWorker(list(self.queue), self.disc["mount"],

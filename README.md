@@ -2,7 +2,7 @@
 
 > A private vibe-coding project — built to learn macOS multimedia, Blu-ray internals, and PyQt6. Made interactively with AI.
 
-Rips DVDs and Blu-rays to MP4 on macOS (Apple Silicon).
+Rips DVDs and Blu-rays to MP4 on macOS (Apple Silicon). Not all discs may be readable — results depend on disc condition, drive hardware, and copy protection.
 
 | App | File |
 |-----|------|
